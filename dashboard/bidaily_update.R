@@ -114,7 +114,7 @@ sites <- c("sfm", "chd", "pfal")
 new_data <- map_dfr(sites,
                      ~retrieve_WET_api_data(
                        site_code = .x,
-                       start_date = Sys.time()-hours(12),
+                       start_date = Sys.time()-hours(6),
                        end_date = Sys.time(),
                        data_type = "all"))
 
