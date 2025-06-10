@@ -48,7 +48,7 @@ retrieve_WET_api_data <- function(site_code, start_datetime, end_datetime = Sys.
                              sensor_number = c(11, 12, 13, 15, 16, 17,19,20))
     #tibble of the site numbers and their corresponding site codes
     site_numbers <- tibble(site_code = c("sfm", "chd", "pfal"),
-                             site_num = c(115170, 1152900, 115310))%>%
+                             site_num = c(115170, 115290, 115310))%>%
       filter(site_code == !!site_code) #filter for sites selected
 
     #grab either all parameters or only the selected parameters
@@ -107,5 +107,6 @@ process_urls <- function(indv_url, data_type, site_code) {
     return(WQ_data)
 
 }
+
 
 
