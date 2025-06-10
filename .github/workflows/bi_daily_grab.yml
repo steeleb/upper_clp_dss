@@ -32,7 +32,7 @@ jobs:
       uses: actions/checkout@v3
 
     - name: Run bidaily_grab.R
-      run: Rscript -e 'source("dashboard/bidaily_grab.R")'
+      run: Rscript -e 'source("dashboard/bidaily_update.R")'
 
     - name: Commit and push changes
       run: |
