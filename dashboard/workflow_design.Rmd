@@ -1,0 +1,602 @@
+---
+title: "overview"
+author: "Sam Struthers"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+start_time <- Sys.time()
+
+knitr::opts_chunk$set(echo = TRUE)
+package_loader <- function(x) {
+  if (x %in% installed.packages()) {
+    suppressMessages({
+      library(x, character.only = TRUE)
+    })
+  } else {
+    suppressMessages({
+      install.packages(x)
+      library(x, character.only = TRUE)
+    })
+  }
+}
+
+invisible(
+  lapply(c("arrow",
+           "data.table",
+           "httr2",
+           "tidyverse",
+           "lubridate",
+           "zoo",
+           "padr",
+           "stats",
+           "RcppRoll",
+           "yaml",
+           "here",
+           #"fcw.qaqc",
+           "furrr", 
+           "purrr", 
+           "here",
+           "rvest",
+           "readr"
+  ),
+  package_loader)
+)
+
+  # Helper function
+  `%nin%` <- Negate(`%in%`) 
+  
+  #manually load in fcw_qaqc functions since sourcing the package is not currently working...
+walk(list.files('src/fcw_QAQC_func/', pattern = "*.R", full.names = TRUE, recursive = TRUE), source)
+
+```
+
+# Sites
+
+# Pulling in data
+
+## Radio Telemetry
+
+This comes through the WET API service which creates a web page for each site and sensor
+
+```{r}
+
+source("dashboard/src/pull_WET_api.R")
+
+sites <- c("sfm", "chd", "pfal")
+
+
+new_WET_data <- map_dfr(sites,
+                     ~pull_wet_api(
+                       site_code = .x,
+                       start_datetime = Sys.time()-days(7),
+                       end_datetime = Sys.time(),
+                       data_type = "all",
+                       time_window = "all"
+                     ))
+
+  # these values were used in testing or are invalid values that we want to filter out
+  #TODO: We may not want to filter them at this step but will later on so that I can see when a sensor is down
+  invalid_values <- c(-9999, 638.30, -99.99)
+
+clean_WET_data <- new_WET_data %>%
+  filter(value %nin% invalid_values)%>%
+  mutate(DT_round = DT_round_utc)%>%
+  split(f = list(.$site, .$parameter), sep = "-")
+    
+# #plot
+# new_WET_data %>%
+#   filter(value %nin% invalid_values, value >0 )%>%
+#   ggplot(aes(x = DT_round_MT, y = value, color = site)) +
+#   geom_line() +
+#   facet_wrap(~parameter, scales = "free_y") +
+#   labs(title = "Water Quality Data from WET API",
+#        x = "Date and Time",
+#        y = "Value",
+#        color = "Parameter") +
+#   theme_minimal() +
+#   scale_color_brewer(palette = "Set1") +
+#   theme(legend.position = "bottom")
+
+```
+
+## HydroVu Livestream
+
+All of the lower sites livestream at a 3 hour interval but our Canyon Mouth site (located just above Greeley intake) does send to this service at a 1 hour interval (we can increase this if needed)
+
+
+```{r}
+
+# Set up parallel processing
+num_workers <- min(availableCores() - 1, 4) # Use at most 4 workers
+plan(multisession, workers = num_workers)
+furrr_options(
+  globals = TRUE,
+  packages = c("arrow", "data.table", "httr2", "tidyverse", "lubridate", "zoo",
+               "padr", "stats", "RcppRoll", "yaml", "here", "fcw.qaqc")
+)
+
+# suppress scientific notation to ensure consistent formatting
+options(scipen = 999)
+
+# Establishing staging directory
+staging_directory <- here("data", "api_pull", "raw")
+
+# Read in credentials
+hv_creds <- read_yaml(here("creds", "HydroVuCreds.yml"))
+hv_token <- hv_auth(client_id = as.character(hv_creds["client"]),
+                    client_secret = as.character(hv_creds["secret"]))
+
+# Pulling in the data from hydrovu
+# Making the list of sites that we need
+hv_sites <- hv_locations_all(hv_token) %>%
+  filter(!grepl("vulink", name, ignore.case = TRUE))
+
+mst_start <- Sys.time() - days(7) # one week ago
+mst_end <- Sys.time() # now
+
+# these sites are backed up on HydroVu but most do not livestream
+# TODO: set up a daily CRON job that will look to see if any new data is available on HydroVu and grab it when possible?
+# sites <- c( "cbri", "chd","joei",  "pbd", "pbr","pfal", "pman", "sfm") 
+
+#Canyon mouth does send data to livestream
+sites <- c("pbd")
+
+walk(sites,
+     function(site) {
+       message("Requesting HV data for: ", site)
+       api_puller(
+         site = site,
+        network = "all",
+         start_dt = with_tz(mst_start, tzone = "UTC"),
+         end_dt = with_tz(mst_end, tzone = "UTC"),
+         api_token = hv_token,
+         hv_sites_arg = hv_sites,
+         dump_dir = staging_directory
+       )
+     }
+)
+
+
+# read in data from staging directory
+
+hv_data <- list.files(staging_directory, full.names = TRUE) %>%
+  future_map_dfr(function(file_path){
+    site_df <- read_parquet(file_path, as_data_frame = TRUE)
+    return(site_df)
+  }, .progress = TRUE)
+
+#quick clean up 
+
+hv_cleaner <- hv_data %>%
+  data.table() %>%
+  select(-id) %>%
+  mutate(units = as.character(units)) %>%
+  #double check that Vulink data has been removed
+  filter(!grepl("vulink", name, ignore.case = TRUE)) %>%
+  mutate(
+    DT = timestamp,
+    DT_round = round_date(DT, "15 minutes"),
+    #DT_round_MT = with_tz(DT_round, tzone = "America/Denver"),
+    DT_join = as.character(DT_round),
+    site = tolower(site)) %>%
+  select(-name) %>%
+  distinct(.keep_all = TRUE) %>%
+  split(f = list(.$site, .$parameter), sep = "-") %>%
+  keep(~nrow(.) > 0)
+
+
+
+```
+
+# Contrail Pull
+
+Need to figure out if there is a API for contrail but for now this will work...
+
+```{r}
+
+source("dashboard/src/pull_contrail_api.R")
+start_DT <- Sys.time() - days(7)
+end_DT <- Sys.time()
+
+
+# Read credentials
+creds <- yaml::read_yaml("creds/contrail_creds.yml") %>%
+  unlist()
+username <- as.character(creds["username"])
+password <- as.character(creds["password"])
+
+
+# Define the folder path where the CSV files are stored
+# Call the downloader function
+contrail_data <- pull_contrail_api(start_DT, end_DT, username,password)%>%
+  bind_rows()
+
+contrail_clean <- contrail_data%>%
+  mutate(DT = as.POSIXct(Reading, tz = "UTC"),
+         DT_round = round_date(DT, "15 minutes"),
+         DT_round_MT = with_tz(DT_round, tz = "America/Denver"),
+         DT_join = as.character(DT_round),
+         site_code = paste0(tolower(site_code), "_fc")) %>%
+  select( -`Data Quality`, -Reading, -Receive, site = site_code, 
+          value = Value, 
+          units = Unit) %>%
+  split(f = list(.$site, .$parameter), sep = "-") %>%
+  keep(~nrow(.) > 0)
+
+
+# ggplot(contrail_clean, aes(x = DT_round_MT, y = value, color = site)) +
+#   geom_line() +
+#   facet_wrap(~parameter, scales = "free_y")+
+#   labs(title = "Contrail Data",
+#        x = "Date",
+#        y = "Value",
+#        color = "Site") +
+#   theme_minimal()
+```
+
+
+
+
+# To Do next...
+
+Most of this is pulled from 2024 hydrovu api pull 
+
+```{r}
+# combine all data 
+
+all_data_raw <- c(hv_cleaner, clean_WET_data, contrail_clean)
+
+# remove stage data 
+list_names <- names(all_data_raw)
+keep_indices <- !grepl("stage", list_names, ignore.case = TRUE)
+all_data_raw <- all_data_raw[keep_indices]
+
+# Tidy all the raw files
+tidy_data <- all_data_raw %>%
+  map(~tidy_api_data(api_data = .)) %>%  # the summarize interval default is 15 minutes
+  keep(~!is.null(.))
+
+#add field notes
+# Pulling in the data from mWater (where we record our field notes)
+mWater_creds <- read_yaml(here("creds", "mWaterCreds.yml"))
+mWater_data <- load_mWater(creds = mWater_creds)
+all_field_notes <- grab_mWater_sensor_notes(mWater_api_data = mWater_data)%>%
+  mutate(DT_round = with_tz(DT_round, tzone = "UTC"),
+         last_site_visit = with_tz(last_site_visit, tzone = "UTC"),
+         DT_join = as.character(DT_round))
+sensor_malfunction_notes <- grab_mWater_malfunction_notes(mWater_api_data = mWater_data)%>%
+  mutate(start_DT = with_tz(start_DT, tzone = "UTC"),
+         end_DT = with_tz(end_DT, tzone = "UTC"))
+
+# Add the field note data to all of the data
+#TODO: check in with FC about their field note taking so we can try to add that in later on
+
+combined_data <- tidy_data %>%
+  future_map(~add_field_notes(df = ., notes = all_field_notes), .progress = TRUE)
+
+# # add QAQC things...
+# 
+
+# # Add summary statistics
+summarized_data <- combined_data %>%
+  map(~generate_summary_statistics(.))
+```
+
+
+## Applying QAQC Code
+
+Juan is updating the QAQC Code right now (in particular the season thresholds dataset) so we can hold off on this for now. 
+We will also need to create some seasonal thresholds for the FC sites (PBR_fc and PMAN_fc) and integrate them here too
+
+```{r}
+# # Read in the threshold data first
+# # sensor_thresholds <- read_yaml(here("data","manual_data_verification","2024_cycle", "hydro_vu_pull", "thresholds", "sensor_spec_thresholds.yml"))
+#season_thresholds <- read_csv(here("data","manual_data_verification","2024_cycle", "hydro_vu_pull", "thresholds", "outdated_seasonal_thresholds.csv"), show_col_types = FALSE)
+
+# 
+# # Chunk the data for furrr
+# summarized_data_chunks <- split(1:length(summarized_data),
+#                                 ceiling(seq_along(1:length(summarized_data))/10))
+# # Flag data...
+# # Single parameter flags
+# single_sensor_flags <- list()
+# for (chunk_idx in seq_along(summarized_data_chunks)) {
+#   message("\n=== Processing chunk ", chunk_idx, " of ", length(summarized_data_chunks), " ===")
+# 
+#   # Get the indices for this chunk
+#   indices <- summarized_data_chunks[[chunk_idx]]
+#   chunk_data <- summarized_data[indices]
+# 
+#   # Process the chunk in parallel
+#   chunk_results <- chunk_data %>%
+#     future_map(
+#       function(data) {
+#         flagged_data <- data %>%
+#           data.table(.) %>%
+#           # flag field visits
+#           add_field_flag(df = .) %>%
+#           # flag missing data
+#           add_na_flag(df = .) %>%
+#           # flag DO noise
+#           find_do_noise(df = .) %>%
+#           # flag repeating values
+#           add_repeat_flag(df = .) %>%
+#           # find times when sonde was moved up/down in housing
+#           add_depth_shift_flag(df = ., level_shift_table =  all_field_notes, post2024 = TRUE) %>%
+#           # find instances of sensor drift (FDOM, Chl-a, Turbidity only)
+#           add_drift_flag(df = .)
+# 
+#         if (unique(data$parameter) %in% names(sensor_thresholds)) {
+#           # flag instances outside the spec range
+#           flagged_data <- flagged_data %>%
+#             data.table(.) %>%
+#             add_spec_flag(df = ., spec_table = sensor_thresholds)
+#         }
+# 
+#         if (unique(data$parameter) %in% unique(season_thresholds$parameter)) {
+#           # flag instances outside the spec range
+#           flagged_data <- flagged_data %>%
+#             data.table(.) %>%
+#             add_seasonal_flag(df = ., threshold_table = season_thresholds)
+#         }
+# 
+#         flagged_data <- flagged_data %>%
+#           data.table(.)
+# 
+#         return(flagged_data)
+#       },
+#       .progress = TRUE
+#     )
+# 
+#   # Add chunk to list
+#   single_sensor_flags <- c(single_sensor_flags, chunk_results)
+# 
+#   if (chunk_idx < length(summarized_data_chunks)) {
+#     message("Taking a short break before next chunk...")
+#     gc()
+#     Sys.sleep(0.1)
+#   }
+# }
+# 
+# # Intrasensor flags
+# intrasensor_flags <- single_sensor_flags %>%
+#   rbindlist(fill = TRUE) %>%
+#   split(by = "site")
+# 
+# # Chunk the data for furrr
+# intrasensor_data_chunks <- split(1:length(intrasensor_flags),
+#                                  ceiling(seq_along(1:length(intrasensor_flags))/3))
+# 
+# intrasensor_flags_list <- list()
+# for (chunk_idx in seq_along(intrasensor_data_chunks)) {
+#   message("\n=== Processing chunk ", chunk_idx, " of ", length(intrasensor_data_chunks), " ===")
+# 
+#   # Get the indices for this chunk
+#   indices <- intrasensor_data_chunks[[chunk_idx]]
+#   chunk_data <- intrasensor_flags[indices]
+#   # Process the chunk in parallel
+#   chunk_results <- chunk_data %>%
+#     map(
+#       function(data) {
+#         # A chunk is a site df
+#         flagged_data <- data %>%
+#           data.table() %>%
+#           # flag times when water was below freezing
+#           add_frozen_flag(.) %>%
+#           # overflagging correction. remove slope violation flag if it occurs concurrently
+#           # with temp or depth
+#           intersensor_check(.) %>%
+#           # add sonde burial. If DO is noise is long-term, likely burial:
+#           add_burial_flag(.) %>%
+#           # flag times when sonde was unsubmerged
+#           add_unsubmerged_flag(.)
+# 
+#         return(flagged_data)
+#       }, .progress = TRUE
+#     ) %>%
+#     rbindlist(fill = TRUE) %>%
+#     # lil' cleanup of flag column contents
+#     dplyr::mutate(flag = ifelse(flag == "", NA, flag)) %>%
+#     # transform back to site-parameter dfs
+#     split(f = list(.$site, .$parameter), sep = "-") %>%
+#     purrr::discard(~ nrow(.) == 0) %>%
+#     # Add in KNOWN instances of sensor malfunction
+#     map(~add_malfunction_flag(df = ., malfunction_records = sensor_malfunction_notes))
+# 
+#   # Add chunk to list
+#   intrasensor_flags_list <- c(intrasensor_flags_list, chunk_results)
+# 
+#   if (chunk_idx < length(intrasensor_data_chunks)) {
+#     message("Taking a short break before next chunk...")
+#     gc()
+#     Sys.sleep(0.1)
+#   }
+# }
+# 
+# # Because we are pulling in all of the data for all of the sites, and the
+# # network check to do that is not applicable, here we make a custom net work check function
+# #TODO: Fix this for our livestreaming network
+# #custom_network_check <- function(df, intrasensor_flags_arg = intrasensor_flags_list) {
+# 
+#   site_name <- unique(na.omit(df$site))
+#   parameter_name <- unique(na.omit(df$parameter))
+# 
+#   sites_order <-  c("chd",
+#                     "pfal",
+#                     "sfm",
+#                     "pbd")
+#   
+# #TODO: Decide what to do with other sites that are not livestreaming
+#   # missing sites: mtncampus
+#   if (site_name %in% c("mtncampus", "joei","cbri","pman", "pbr")){
+#     return(df)
+#   }
+# 
+#   # Find the index of current site in ordered list
+#   site_index <- which(sites_order == sites_order[grep(site_name, sites_order, ignore.case = TRUE)])
+# 
+#   # Create site-parameter identifier
+#   site_param <- paste0(site_name, "-", parameter_name)
+# 
+#   # Initialize empty dataframes for upstream/downstream sites
+#   upstr_site_df <- tibble(DT_round = NA)
+#   dnstr_site_df <- tibble(DT_round = NA)
+# 
+#   # Try to get upstream site data
+#   tryCatch({
+#     # Skip trying to find upstream sites for first sites
+#     if (site_index != 1){
+#       previous_site <- paste0(sites_order[site_index-1], "-", parameter_name)
+#       upstr_site_df <- intrasensor_flags_arg[[previous_site]] %>%
+#         select(DT_round, site_up = site, flag_up = flag) %>%
+#         data.table()
+#     }
+#   },
+#   error = function(err) {
+#     message(paste0("No UPSTREAM data found for ", site_param, ". Expected at site '", previous_site, "'."))
+#   })
+# 
+#   # Try to get downstream site data
+#   tryCatch({
+#     # Skip trying to find downstream sites for first sites
+#     if (site_index != length(sites_order)){
+#       next_site <- paste0(sites_order[site_index+1], "-", parameter_name)
+#       dnstr_site_df <- intrasensor_flags_arg[[next_site]] %>%
+#         select(DT_round, site_down = site, flag_down = flag) %>%
+#         data.table()
+#     }
+#   },
+#   error = function(err) {
+#     message(paste0("No DOWNSTREAM data found for ", site_param, ". Expected at site '", next_site, "'."))
+#   })
+# 
+#   # Join current site data with upstream and downstream data
+#   up_down_join <- df %>%
+#     left_join(upstr_site_df, by = "DT_round") %>%
+#     left_join(dnstr_site_df, by = "DT_round")
+# 
+#   # Helper functions
+#   # Function to add column if it doesn't exist
+#   add_column_if_not_exists <- function(df, column_name, default_value = NA) {
+#     if (!column_name %in% colnames(df)) {
+#       df <- df %>% dplyr::mutate(!!sym(column_name) := default_value)
+#     }
+#     return(df)
+#   }
+# 
+#   # Function to check if any flags exist in a time window
+#   check_2_hour_window_fail <- function(x) {
+#     sum(x) >= 1
+#   }
+# 
+#   # Establish helper objects
+#   # String object that is used to ignore flags that we do not want to remove.
+#   ignore_flags <- "drift|DO interference|repeat|sonde not employed|frozen|
+#   unsubmerged|missing data|site visit|sv window|sensor malfunction|burial|
+#   sensor biofouling|improper level cal|sonde moved"
+# 
+#   # Numeric object that determines the width for the rolling window check (2 hours)
+#   width_fun = 17
+# 
+#   # Process flags based on upstream/downstream patterns
+#   final_df <- up_down_join %>%
+#     # Add placeholder columns if joinging didn't provide them
+#     add_column_if_not_exists("flag_down") %>%
+#     add_column_if_not_exists("flag_up") %>%
+#     add_column_if_not_exists("site_down") %>%
+#     add_column_if_not_exists("site_up") %>%
+#     # Create binary indicator for upstream/downstream flags
+#     ## 0 = no relevant flags upstream/downstream
+#     ## 1 = at least one site has relevant flags
+#     dplyr::mutate(flag_binary = dplyr::if_else(
+#       (is.na(flag_up) | grepl(ignore_flags, flag_up)) &
+#         (is.na(flag_down) | grepl(ignore_flags, flag_down)), 0, 1
+#     )) %>%
+#     # Check for flags in 4-hour window (+/-2 hours around each point, 17 observations at 15-min intervals)
+#     dplyr::mutate(overlapping_flag = zoo::rollapply(flag_binary, width = width_fun, FUN = check_2_hour_window_fail, fill = NA, align = "center")) %>%
+#     add_column_if_not_exists(column_name = "auto_flag") %>%
+#     # If flag exists but is also present up/downstream, it likely represents a real event
+#     # In that case, remove the flag (set auto_flag to NA)
+#     dplyr::mutate(auto_flag = ifelse(!is.na(flag) & !grepl(ignore_flags, flag) &
+#                                        (overlapping_flag == TRUE & !is.na(overlapping_flag)), NA, flag)) %>%
+#     dplyr::select(-c(flag_up, flag_down, site_up, site_down, flag_binary, overlapping_flag))
+# 
+#   return(final_df)
+# }
+# 
+# # I really don't understand how network check would work in parallel, so I don't.
+# final_flags <- intrasensor_flags_list %>%
+# #skipping for now
+#   #purrr::map(~custom_network_check(df = ., intrasensor_flags_arg = intrasensor_flags_list)) %>%
+#   rbindlist(fill = TRUE) %>%
+#   tidy_flag_column() %>%
+#   split(f = list(.$site, .$parameter), sep = "-") %>%
+#   purrr::map(~add_suspect_flag(.)) %>%
+#   rbindlist(fill = TRUE)
+# 
+# v_final_flags <- final_flags%>%
+#   dplyr::mutate(auto_flag = ifelse(is.na(auto_flag), NA,
+#                                    ifelse(auto_flag == "suspect data" & is.na(lag(auto_flag, 1)) & is.na(lead(auto_flag, 1)), NA, auto_flag))) %>%
+#   dplyr::select(c("DT_round", "DT_join", "site", "parameter", "mean", "units", "n_obs", "spread", "auto_flag", "mal_flag", "sonde_moved","sonde_employed", "season", "last_site_visit")) %>%
+#   dplyr::mutate(auto_flag = ifelse(is.na(auto_flag), NA, ifelse(auto_flag == "", NA, auto_flag))) %>%
+#   split(f = list(.$site, .$parameter), sep = "-") %>%
+#   keep(~nrow(.) > 0)
+# 
+# # Save the data individually to flagged folder
+# iwalk(v_final_flags, ~write_csv(.x, here("data","api_pull","2024_cycle", "flagged", paste0(.y, ".csv"))))
+# 
+# # store efficiently
+# 
+# # save data
+
+
+```
+
+# Plot data
+
+```{r}
+
+
+# bind all the data in tidy_data
+
+all_data_raw <- combined_data %>%
+  bind_rows()%>%
+  mutate(DT_round_MT = with_tz(DT_round, tzone = "America/Denver"))%>%
+  filter(between(DT_round_MT, start_DT, end_DT))
+
+      p <- ggplot(all_data_raw%>% filter(!is.na(mean)), aes(x = DT_round, y = mean, color = site)) +
+        geom_path() +
+        #theme_light()+
+        facet_wrap(~parameter, scales = "free_y")+#,labeller = as_labeller(c(`Sensor Depth (ft)` = "Sensor Depth (ft)",
+                                                                        # `River Stage (ft)` = "River Stage (ft)",
+                                                                        # `pH` = "pH",
+                                                                        # `Turbidity (NTU)` = "Turbidity (NTU)",
+                                                                        # `Specific Conductivity (uS/cm)` = "Specific Conductivity (uS/cm)",
+                                                                        # `DO (mg/L)` = "DO (mg/L)",
+                                                                        # `Chl-a (RFU)` = "Chl-a (RFU)",
+                                                                        # `Water Temp (C)` = "Water Temp (C)",
+                                                                        # `FDOM (RFU)` = "FDOM (RFU)")),
+                   # strip.position = "left", ncol = col_num)+
+        #color by sites using the palette named bg_colors
+        #scale_color_manual(values = bg_colors)+
+        labs(title = "User Selected data", x = "Date", y = NULL, color = "Site")+
+        theme(strip.background = element_blank(),
+              strip.placement = "outside")
+
+      plotly::ggplotly(p)
+      
+      end_time <- Sys.time()
+
+time_elapsed <- difftime(end_time, start_time, units = "secs")
+print(time_elapsed)
+      
+```
+
+
+```{r}
+
+```
+
+
