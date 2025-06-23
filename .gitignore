@@ -4,3 +4,6 @@
 .Ruserdata
 data/
 creds/
+
+# mac artifacts
+**.DS_Store
