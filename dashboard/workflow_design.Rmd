@@ -176,10 +176,10 @@ hv_data <- list.files(staging_directory, full.names = TRUE, pattern = ".parquet"
   #double check that Vulink data has been removed
   filter(!grepl("vulink", name, ignore.case = TRUE)) %>%
   mutate(
-    DT = timestamp,
-    DT_round = round_date(DT, "15 minutes"),
+    DT = timestamp, #timestamp comes in UTC
+    DT_round = round_date(DT, "15 minutes"), #rounding
     #DT_round_MT = with_tz(DT_round, tzone = "America/Denver"),
-    DT_join = as.character(DT_round),
+    DT_join = as.character(DT_round), #keeping in UTC but character form
     site = tolower(site)) %>%
   select(-name) %>%
   distinct(.keep_all = TRUE) %>%
@@ -239,10 +239,13 @@ tidy_data <- all_data_raw %>%
 mWater_creds <- read_yaml(here("creds", "mWaterCreds.yml"))
 mWater_data <- load_mWater(creds = mWater_creds)
 all_field_notes <- grab_mWater_sensor_notes(mWater_api_data = mWater_data)%>%
+  #notes come in as MST, converting to UTC
   mutate(DT_round = with_tz(DT_round, tzone = "UTC"),
          last_site_visit = with_tz(last_site_visit, tzone = "UTC"),
          DT_join = as.character(DT_round))
-sensor_malfunction_notes <- grab_mWater_malfunction_notes(mWater_api_data = mWater_data)%>%
+
+sensor_malfunction_notes <- grab_mWater_malfunction_notes(mWater_api_data = mWater_data)%>% 
+  #notes come in as MST, converting to UTC
   mutate(start_DT = with_tz(start_DT, tzone = "UTC"),
          end_DT = with_tz(end_DT, tzone = "UTC"))
 
@@ -538,6 +541,7 @@ We will also need to create some seasonal thresholds for the FC sites (PBR_fc an
 
 all_data_raw <- combined_data %>%
   bind_rows()%>%
+  # DT round is in UTC, converting to Mountain Time for plotting
   mutate(DT_round_MT = with_tz(DT_round, tzone = "America/Denver"))%>%
   filter(between(DT_round_MT, start_DT, end_DT))%>%
   #rounding to make plotting easier
