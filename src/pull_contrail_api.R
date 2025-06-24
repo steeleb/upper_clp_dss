@@ -153,11 +153,13 @@ pull_contrail_api <- function(start_DT, end_DT = Sys.time(), username, password,
 
         # Save the CSV data
         csv_content <- resp_body_string(download_resp)
+
         # Parse the CSV content
         parsed_data <- read_csv(csv_content, show_col_types = FALSE)%>%
           #convert datetimes, add in sites and paramters
           mutate(
-               DT = as.POSIXct(Reading, tz = "UTC"), # Convert Reading to POSIXct in UTC
+               DT_MT = force_tz(Reading, tzone = "America/Denver"), # Force Reading to America/Denver timezone
+               DT = with_tz(DT_MT, tzone = "UTC"), # Force Reading to UTC timezone
                DT_round = round_date(DT, "15 minutes"), # Round the DT to 15 minute intervals
                DT_round_MT = with_tz(DT_round, tz = "America/Denver"), # Create a MT version of the Reading date
                DT_join = as.character(DT_round), # Create a character version of the UTC time
