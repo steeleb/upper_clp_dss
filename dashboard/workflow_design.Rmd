@@ -19,48 +19,6 @@ walk(list.files('src/fcw_QAQC_func/', pattern = "*.R", full.names = TRUE, recurs
 To help visualize!
 
 ```{r}
-
-flow_sites <- cdssr::get_telemetry_stations(water_district = 3 )%>% # Specify Poudre basin
-        filter(station_por_end > Sys.Date() - days(30))%>%# only grab active sites
-        filter(grepl("DIS", parameter))%>%
-  st_as_sf(coords = c("longitude", "latitude"), crs = 4326)%>%
-  mutate(icon = ifelse(structure_type == "Stream Gage", "water", "triangle"))
-    #structure_type %in% c("Ditch", "Other", "Measuring Point", "Reser")
-my_icons <- awesomeIcons(icon = flow_sites$icon,
-                         markerColor = "blue",
-                         library = "glyphicon")
-
-
-# Load the site map data
-site_loc <- read_csv(here("data", "metadata", "sonde_location_metadata.csv"), show_col_types = F)%>%
-  separate(col = "lat_long", into = c("lat", "lon"), sep = ",", convert = TRUE)%>%
-  st_as_sf(coords = c("lon", "lat"), crs = 4326)
-
-
-pal <- colorFactor(
-  palette = c("red", "blue", "green", "purple", "orange"),
-  domain = site_loc$Project
-)
-
-# Create a leaflet map to visualize the sites
-leaflet(site_loc) %>%
-  addTiles() %>%
-  addCircleMarkers(
-    radius = 5,
-    color = ~pal(Project),
-    fillOpacity = 0.5,
-    popup = ~paste("Site:", Site, "<br>", 
-                   "Project: ", Project)
-  ) %>%
-  addAwesomeMarkers(
-    data = flow_sites,
-    icon = ~my_icons[structure_type],
-    popup = ~paste("Flow Site:", station_name), 
-  )
-  #setView(lng = -111.9, lat = 40.7, zoom = 8) # Adjust the view to center on the sites
-```
-
-```{r}
 flow_sites <- cdssr::get_telemetry_stations(water_district = 3) %>% # Specify Poudre basin
   filter(station_por_end > Sys.Date() - days(30)) %>% # only grab active sites
   filter(grepl("DIS", parameter)) %>%
@@ -100,11 +58,22 @@ leaflet(site_loc) %>%
     popup = ~paste("Flow Site:", station_name, "<br>",
                    "Structure Type:", structure_type)
   )
+
 ```
 
 # Pulling in data
 
 A few notes: When present, the column `DT_round` will be in UTC and `DT_round_MT` will be in Mountain Time. The column `value` is the raw value recorded at that time. The column `parameter` is the name of the parameter being measured (e.g., "water_temperature", "turbidity", etc.). The column `site` is the acronym of the site where the data was collected.
+
+# setting up dates
+
+```{r}
+
+start_DT <- Sys.time() - days(7) # Set the start date to 7 days ago
+end_DT <- Sys.time() # Set the end date to now
+
+```
+
 
 ## Radio Telemetry
 
@@ -112,42 +81,26 @@ This comes through the WET API service which creates a web page for each site an
 
 ```{r}
 
-source("src/pull_wet_api.R")
-
-sites <- c("sfm", "chd", "pfal")
-
-new_WET_data <- map(sites,
-                     ~pull_wet_api(
-                       target_site = .x,
-                       start_datetime = Sys.time()-days(7),
-                       end_datetime = Sys.time(),
-                       data_type = "all",
-                       time_window = "all"
-                     ))%>%
-  rbindlist()
-
   # these values were used in testing or are invalid values that we want to filter out
   #TODO: We may not want to filter them at this step but will later on so that I can see when a sensor is down
   invalid_values <- c(-9999, 638.30, -99.99)
 
-clean_WET_data <- new_WET_data %>%
+source("src/pull_wet_api.R")
+
+sites <- c("sfm", "chd", "pfal")
+
+wet_data <- map(sites,
+                     ~pull_wet_api(
+                       target_site = .x,
+                       start_datetime = start_DT,
+                       end_datetime = end_DT,
+                       data_type = "all",
+                       time_window = "all"
+                     ))%>%
+  rbindlist()%>%
   #remove invalid values or NAs
   filter(value %nin% invalid_values, !is.na(value))%>%
   split(f = list(.$site, .$parameter), sep = "-")
-    
-# #plot
-# new_WET_data %>%
-#   filter(value %nin% invalid_values,!is.na(value), value >0 )%>%
-#   ggplot(aes(x = DT_round_MT, y = value, color = site)) +
-#   geom_line() +
-#   facet_wrap(~parameter, scales = "free_y") +
-#   labs(title = "Water Quality Data from WET API",
-#        x = "Date and Time",
-#        y = "Value",
-#        color = "Parameter") +
-#   theme_minimal() +
-#   scale_color_brewer(palette = "Set1") +
-#   theme(legend.position = "bottom")
 
 ```
 
@@ -182,10 +135,10 @@ hv_token <- hv_auth(client_id = as.character(hv_creds["client"]),
 # Pulling in the data from hydrovu
 # Making the list of sites that we need
 hv_sites <- hv_locations_all(hv_token) %>%
-  filter(!grepl("vulink", name, ignore.case = TRUE))
-
-mst_start <- Sys.time() - days(7) # one week ago
-mst_end <- Sys.time() # now
+  filter(!grepl("vulink", name, ignore.case = TRUE))%>%
+  #sondes with 2024 in the name can be avoided to speed up the live data pull 
+  #these should be included in the historical data pull
+  filter(!grepl("2024", name, ignore.case = TRUE))
 
 # these sites are backed up on HydroVu but most do not livestream
 # TODO: set up a daily CRON job that will look to see if any new data is available on HydroVu and grab it when possible?
@@ -200,8 +153,8 @@ walk(sites,
        api_puller(
          site = site,
         network = "all",
-         start_dt = with_tz(mst_start, tzone = "UTC"),
-         end_dt = with_tz(mst_end, tzone = "UTC"),
+         start_dt = with_tz(start_DT, tzone = "UTC"), # api puller needs UTC dates
+         end_dt = with_tz(end_DT, tzone = "UTC"),
          api_token = hv_token,
          hv_sites_arg = hv_sites,
          dump_dir = staging_directory
@@ -216,12 +169,8 @@ hv_data <- list.files(staging_directory, full.names = TRUE, pattern = ".parquet"
   future_map_dfr(function(file_path){
     site_df <- read_parquet(file_path, as_data_frame = TRUE)
     return(site_df)
-  }, .progress = TRUE)
-
-#quick clean up 
-
-hv_cleaner <- hv_data %>%
-  data.table() %>%
+  }, .progress = TRUE) %>%
+  #doing some clean up 
   select(-id) %>%
   mutate(units = as.character(units)) %>%
   #double check that Vulink data has been removed
@@ -248,11 +197,9 @@ Need to figure out if there is a API for contrail but for now this will work...
 ```{r}
 
 source("src/pull_contrail_api.R")
-start_DT <- Sys.time() - days(7)
-end_DT <- Sys.time()
 
 # Read credentials
-creds <- yaml::read_yaml(here("data","upper_clp_dss", "creds","contrail_creds.yml") %>%
+creds <- yaml::read_yaml(here("data","upper_clp_dss", "creds","contrail_creds.yml")) %>%
   unlist()
 username <- as.character(creds["username"])
 password <- as.character(creds["password"])
@@ -261,21 +208,9 @@ contrail_api_urls <- read_csv(here("data","upper_clp_dss", "creds", "contrail_de
 # Define the folder path where the CSV files are stored
 # Call the downloader function
 contrail_data <- pull_contrail_api(start_DT, end_DT, username,password, contrail_api_urls)%>%
-  rbindlist()
-
-contrail_clean <- contrail_data%>%
+  rbindlist()%>%
   split(f = list(.$site, .$parameter), sep = "-") %>%
   keep(~nrow(.) > 0)
-
-
-# ggplot(contrail_data, aes(x = DT_round_MT, y = value, color = site)) +
-#   geom_line() +
-#   facet_wrap(~parameter, scales = "free_y")+
-#   labs(title = "Contrail Data",
-#        x = "Date",
-#        y = "Value",
-#        color = "Site") +
-#   theme_minimal()
 
 ```
 
@@ -287,7 +222,7 @@ Most of this is pulled from 2024 hydrovu api pull
 ```{r}
 # combine all data 
 
-all_data_raw <- c(hv_cleaner, clean_WET_data, contrail_clean)
+all_data_raw <- c(hv_data, wet_data, contrail_data)
 
 # remove stage data 
 list_names <- names(all_data_raw)
@@ -317,12 +252,11 @@ sensor_malfunction_notes <- grab_mWater_malfunction_notes(mWater_api_data = mWat
 combined_data <- tidy_data %>%
   future_map(~add_field_notes(df = ., notes = all_field_notes), .progress = TRUE)
 
-# # add QAQC things...
-# 
-
 # # Add summary statistics
 summarized_data <- combined_data %>%
   map(~generate_summary_statistics(.))
+
+# # add QAQC things...
 ```
 
 
@@ -609,8 +543,7 @@ all_data_raw <- combined_data %>%
   #rounding to make plotting easier
   mutate(mean = signif(mean, 3))
 
-      p <- ggplot(all_data_raw%>% filter(!is.na(mean))%>%
-                    filter(site %in% c("pman_fc", "pbd")), aes(x = DT_round_MT, y = mean, color = site)) +
+      p <- ggplot(all_data_raw%>% filter(!is.na(mean)), aes(x = DT_round_MT, y = mean, color = site)) +
         geom_path() +
         #theme_light()+
         facet_wrap(~parameter, scales = "free_y")+#,labeller = as_labeller(c(`Sensor Depth (ft)` = "Sensor Depth (ft)",
@@ -631,14 +564,11 @@ all_data_raw <- combined_data %>%
 
       plotly::ggplotly(p)
       
-      end_time <- Sys.time()
 
-time_elapsed <- difftime(end_time, start_time, units = "secs")
-print(time_elapsed)
       
 ```
 
-
+# Run below to run entire script
 ```{r}
 
 ```
