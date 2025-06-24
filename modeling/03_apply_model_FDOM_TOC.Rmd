@@ -1,3 +1,4 @@
+Run 02 script to create model then apply to longer/full dataset to see results
 
 # Read in water chem data
 ```{r}
