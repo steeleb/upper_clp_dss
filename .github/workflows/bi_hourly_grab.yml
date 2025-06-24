@@ -1,0 +1,37 @@
+# name: Bi daily Scheduled Script Execution
+# on:
+#   schedule:
+#      - cron:  "0 */2 * * *"
+# jobs:
+#   run-grab-script:
+#     runs-on: ubuntu-latest
+#     steps:
+#     - name: Checkout code
+#       uses: actions/checkout@v4
+#     - name: Set up R
+#       uses: r-lib/actions/setup-r@v2
+#       with:
+#         use-public-rspm: true
+#     - name: Install R packages
+#       uses: r-lib/actions/setup-r-dependencies@v2
+#       with:
+#         cache-version: 2
+#         packages: |
+#           any::tidyverse
+#           any::httr
+#           any::rvest
+#           any::tidyr
+#           any::here
+#           any::httr2
+#           any::purrr
+#           any::arrow
+#
+#     - name: Run bidaily_update.R
+#       run: Rscript -e 'source("dashboard/bidaily_update.R")'
+#     - name: Commit and push changes
+#       run: |
+#         git config --global user.email 'actions@github.com'
+#         git config --global user.name 'Github Actions'
+#         git add data_backup/upper_CLP_WQ_data_2025.parquet
+#         git commit -m "Update parquet file after bi daily pull"
+#         git push origin

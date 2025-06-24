@@ -1,0 +1,9 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+data/
+creds/
+# mac artifacts
+**.DS_Store
+data

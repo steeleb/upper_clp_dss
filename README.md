@@ -20,3 +20,5 @@ This will store code to create a prototype dashboard (Shiny?) for treatment oper
 ### Modeling: 
 This is where we will organize our data and test models to predict grab sample analytes from sensor data
 
+##License:
+The code in this repository is covered by the MIT use license. We request that all downstream uses of this work be available to the public when possible.

@@ -1,0 +1,203 @@
+Run 02 script to create model then apply to longer/full dataset to see results
+
+# Read in water chem data
+```{r}
+water_chem <- read_rds("data/chem/CLP_chemistry_up_to_20241113.rds")%>%
+  mutate(site_code = tolower(site_code), 
+         site_code = case_when(site_code == "archery" ~ "archery virridy",
+                          site_code == "timberline" ~ "timberline virridy",
+                          site_code == "prospect" ~ "prospect virridy",
+                          T ~ site_code))%>%
+  filter(site_code %in% unique(all_sensor_data$site) & DT_mst >= as_date("2023-09-01"))%>%
+  select(site_code, 
+         Date, 
+         DT_sample = DT_mst,
+         TOC = TC, TN, DOC, ChlA, NO3, NH4, PO4, SC, lab_turb = Turbidity, TSS,DT_mst_char)
+
+```
+
+# read in sensor data and format to match model needs
+# Hourly
+
+```{r}
+
+all_sensor_data <- read_rds( "data/sensor/prepped/all_sensor_data.rds")
+
+
+
+prepped_data <- all_sensor_data%>%
+  select(site, 
+         DT_round, 
+         FDOM = `FDOM Fluorescence`,
+         hrs_since_last_cleaning = hours_since_last_visit,
+         Temp = Temperature,
+         Sensor_Cond = `Specific Conductivity`,
+         Sensor_Turb = Turbidity,
+         Chl_a = `Chl-a Fluorescence`) %>%
+  #Sumarize to daily by site
+  mutate(date = as_date(DT_round, tz = "MST"), 
+         hourly_round = round_date(DT_round, unit = "1 hour" ))%>%
+  group_by(site, hourly_round)%>%
+  summarize(across(where(is.numeric), median, na.rm = TRUE))%>%
+    mutate(fc = FDOM/(Chl_a + Sensor_Turb + FDOM))
+
+
+
+prepped_data_norm <- prepped_data %>%
+    mutate(across(where(is.numeric),rescale)) %>%
+    na.omit()
+```
+
+
+# Run model on sensor data to get DOC estimate
+
+```{r}
+
+features <- c('FDOM','hrs_since_last_cleaning', 'Sensor_Turb','Chl_a','Temp','fc')
+
+
+target <- 'DOC'
+
+prepped_data_matrix <- as.matrix(prepped_data_norm[,features])
+
+prepped_data_norm$doc_guess <- predict(doc_mod, prepped_data_matrix)
+```
+
+# Make a plot
+
+```{r}
+
+best_sites <- c("cbri", "pfal", "sfm", "pbd")
+
+#rename the sites in the plot 
+plot_data <- prepped_data_norm%>%
+  filter( year(hourly_round) == 2024 & site %in% best_sites)%>%
+  mutate(site = case_when(site == "cbri" ~ "Chambers Inflow",
+                          site == "pfal" ~ "Below Poudre Falls",
+                          site == "sfm" ~ "South Fork",
+                          site == "pbd" ~ "Canyon Mouth",
+                          TRUE ~ site))
+
+plot_data$site_f <- factor(plot_data$site, levels = c("Chambers Inflow", "Below Poudre Falls", "South Fork", "Canyon Mouth"))
+
+plot_wc <- water_chem%>%
+  filter(year(DT_sample) == 2024 & site_code %in% best_sites)%>%
+  mutate(site = case_when(site_code == "cbri" ~ "Chambers Inflow",
+                          site_code == "pfal" ~ "Below Poudre Falls",
+                          site_code == "sfm" ~ "South Fork",
+                          site_code == "pbd" ~ "Canyon Mouth",
+                          TRUE ~ site_code))
+  plot_wc$site_f <- factor(plot_wc$site, levels = c("Chambers Inflow", "Below Poudre Falls", "South Fork", "Canyon Mouth"))
+  
+ggplot(plot_data, aes(x = hourly_round))+
+  geom_point( aes(y = doc_guess, color = "Model estimate from sensor data"), size = 2)+
+  geom_point(data = plot_wc, 
+             aes(x = DT_sample, y = DOC, color = "Measured"), size = 2)+
+  facet_wrap( .~site_f)+
+  labs(
+    x = "Date", 
+    y = "Hourly DOC (mg/L)", 
+    color = "")+
+  scale_color_manual(values = c("Model estimate from sensor data" = "#E70870", "Measured" =  "#002EA3"))+
+  theme_few(base_size = 28)+
+  theme(legend.position = "bottom")
+  
+ggsave("images/doc_hourly_ts.png", width = 12, height = 8, units = "in", dpi = 300)
+```
+
+
+
+
+# Daily
+
+```{r}
+
+
+all_sensor_data <- read_rds( "data/sensor/prepped/all_sensor_data.rds")
+
+
+prepped_data <- all_sensor_data%>%
+  select(site, 
+         DT_round, 
+         FDOM = `FDOM Fluorescence`,
+         hrs_since_last_cleaning = hours_since_last_visit,
+         Temp = Temperature,
+         Sensor_Cond = `Specific Conductivity`,
+         Sensor_Turb = Turbidity,
+         Chl_a = `Chl-a Fluorescence`) %>%
+  #Sumarize to daily by site
+  mutate(date = as_date(DT_round, tz = "MST"), 
+         hourly_round = round_date(DT_round, unit = "1 hour" ))%>%
+  group_by(site, date)%>%
+  summarize(across(where(is.numeric), median, na.rm = TRUE))%>%
+    mutate(fc = FDOM/(Chl_a + Sensor_Turb + FDOM))
+
+
+
+prepped_data_norm <- prepped_data %>%
+    mutate(across(where(is.numeric),rescale)) %>%
+    na.omit()
+```
+
+
+# Run model on sensor data to get TOC estimate
+
+```{r}
+
+features <- c('FDOM','hrs_since_last_cleaning', 'Sensor_Turb','Chl_a','Temp','fc')
+
+target <- 'TOC'
+
+prepped_data_matrix <- as.matrix(prepped_data_norm[,features])
+
+prepped_data_norm$toc_guess <- predict(toc_mod, prepped_data_matrix)
+```
+
+# Make a plot
+
+```{r}
+
+best_sites <- c("pbd", "pfal", "sfm", "lincoln")
+#best_sites <- unique(prepped_data_norm$site)
+
+#rename the sites in the plot 
+plot_data <- prepped_data_norm%>%
+  filter( year(date) == 2024 & site %in% best_sites)%>%
+  mutate(site = case_when(site == "cbri" ~ "Chambers Inflow",
+                          site == "pfal" ~ "Poudre River Below Poudre Falls",
+                          site == "sfm" ~ "South Fork of the Poudre River",
+                          site == "pbd" ~ "Poudre River at Greeley Intake",
+                          site == "penn" ~ "Pennock Creek",
+                          site == "lincoln" ~ "Poudre River at Lincoln Ave",
+                          TRUE ~ site))
+
+plot_data$site_f <- factor(plot_data$site, levels = c("Chambers Inflow", "Pennock Creek", "Poudre River Below Poudre Falls", "South Fork of the Poudre River", "Poudre River at Greeley Intake", "Poudre River at Lincoln Ave"))
+
+plot_wc <- water_chem%>%
+  filter(year(DT_sample) == 2024 & site_code %in% best_sites)%>%
+  mutate(site = case_when(site_code == "cbri" ~ "Chambers Inflow",
+                          site_code == "pfal" ~ "Poudre River Below Poudre Falls",
+                          site_code == "sfm" ~ "South Fork of the Poudre River",
+                          site_code == "pbd" ~ "Poudre River at Greeley Intake",
+                          site_code == "penn" ~ "Pennock Creek",
+                          site_code == "lincoln" ~ "Poudre River at Lincoln Ave",
+                          TRUE ~ site_code))
+  plot_wc$site_f <- factor(plot_wc$site, levels = c("Chambers Inflow", "Poudre River Below Poudre Falls", "South Fork of the Poudre River", "Poudre River at Greeley Intake", "Poudre River at Lincoln Ave", "Pennock Creek"))
+  
+ggplot(plot_data, aes(x = date))+
+  geom_point( aes(y = toc_guess, color = "Model Estimate from Sensor Data"), size = 2)+
+  geom_point(data = plot_wc, 
+             aes(x = Date, y = TOC, color = "Measured"), size = 2)+
+  facet_wrap( .~site_f)+
+  labs(
+    x = "Date", 
+    y = "Daily TOC (mg/L)", 
+    color = "")+
+  scale_color_manual(values = c("Model Estimate from Sensor Data" = "#E70870", "Measured" =  "#002EA3"))+
+  theme_few(base_size = 28)+
+  theme(legend.position = "bottom")
+  
+ggsave("images/toc_daily_ts.png", width = 12, height = 8, units = "in", dpi = 300)
+```
+
+
