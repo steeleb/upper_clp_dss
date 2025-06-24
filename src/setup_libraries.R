@@ -1,32 +1,78 @@
 #this file contains all the packages,metadata, groupings and color palettes that are used in downstream scripts
 
-### ----- Load packages ----- ###
-package_load <- function(package_names){
-  for(i in 1:length(package_names)){
-    if(!package_names[i] %in% installed.packages()){
-      install.packages(package_names[i])
-    }
-    library(package_names[i],character.only = TRUE)
+knitr::opts_chunk$set(echo = TRUE)
+package_loader <- function(x) {
+  if (x %in% installed.packages()) {
+    suppressMessages({
+      library(x, character.only = TRUE)
+    })
+  } else {
+    suppressMessages({
+      install.packages(x)
+      library(x, character.only = TRUE)
+    })
   }
 }
 
-#vector of packages
-pack_req <- c(
-  # data wrangling packages
-  "tidyverse","lubridate","padr","janitor","padr", "broom","arrow","zoo",
-  #spatial packages
-  "sf","terra","nhdplusTools", "tigris","raster", "leaflet","tmap",
-  # plotting
-  "ggpubr","ggthemes","scales","corrplot","gghighlight","patchwork", "geomtextpath", "ggbeeswarm","plotly", "ggpmisc","flextable",
-  # web scrapping
-  "rjson", "rvest", "dataRetrieval", "httr", "jsonlite", "RSelenium",
-  #extra
-  "devtools", "trend")
-package_load(pack_req)
+invisible(
+  lapply(c(
+    # Core data manipulation
+    "tidyverse",
+    "data.table",
+    "arrow",
+    "furrr",
+    # Date/time handling
+    "zoo",
+    "padr",
+    # Data cleaning and utilities
+    "janitor",
+    "broom",
+    "here",
+    # Stats/modeling
+    "stats",
+    "RcppRoll",
+    "trend",
+    "xgboost",
+    "scales",
+    # Spatial packages
+    "sf",
+    "terra",
+    "raster",
+    "nhdplusTools",
+    "tigris",
+    "leaflet",
+    "tmap",
+    "mapview",
+    # Vis
+    "ggpubr",
+    "ggthemes",
+    "scales",
+    "corrplot",
+    "gghighlight",
+    "patchwork",
+    "geomtextpath",
+    "ggbeeswarm",
+    "plotly",
+    "ggpmisc",
+    "flextable",
+    # Web scraping/data retrieval
+    "rvest",
+    "httr",
+    "httr2",
+    "rjson",
+    "jsonlite",
+    "dataRetrieval",
+    "RSelenium",
+    "cdssr",
+    "yaml",
+    # Development tools
+    "devtools"
+  ),
+  package_loader)
+)
 
-
-
-rm(pack_req, package_load)
+# Helper function
+`%nin%` <- Negate(`%in%`)
 #Simple function to negate %in%
 `%nin%` = Negate(`%in%`)
 
@@ -55,9 +101,6 @@ sensor_meta <- tibble(
                 F,T,T,T,T,F,
                 T,T,F))
 
-### ----- site and date groupings ----- ###
-
-
 ### ----- Color Sets ----- ###
 
 #cbbPalette <- c( "#999999","#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
@@ -66,7 +109,6 @@ sensor_meta <- tibble(
 #season_color_vals =c('#047E82','#397534','#59B851','#DEB907','#FA850E')
 require(tidyverse)
 require(ggthemes)
-
 # basic theme for all ggplots, if Roboto is not installed, just use default, but message
 if ({
   require(systemfonts)
