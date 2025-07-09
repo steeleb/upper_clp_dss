@@ -232,45 +232,45 @@ pull_wet_api <- function(target_site, start_datetime, end_datetime = Sys.time(),
     })
   }
 
-  # Not sure if this works yet...
-  is_shiny <- tryCatch({
-    shiny::isRunning()
-  }, error = function(e) FALSE)
-
-  # TODO: Test this in a shiny app, perhaps we add a T/F param to decide which method to use
-  if (is_shiny) {
-    # Running in Shiny - use progress bar and sequential processing
-    progress <- shiny::Progress$new(session, min = 0, max = nrow(urls_dt))
-    progress$set(message = "Retrieving data...", value = 0)
-    on.exit(progress$close())
-
-    WQ_data_list <- vector("list", nrow(urls_dt))
-    for (i in seq_len(nrow(urls_dt))) {
-      progress$set(detail = paste("Processing", urls_dt$data_type[i]), value = i)
-      WQ_data_list[[i]] <- process_urls_optimized(
-        urls_dt$indv_url[i],
-        urls_dt$data_type[i],
-        urls_dt$site_code[i],
-        urls_dt$parameter_units[i]
-      )
-    }
-  } else if (requireNamespace("future", quietly = TRUE) && requireNamespace("furrr", quietly = TRUE)) {
-    # Not in Shiny - use parallel processing if available
-    future::plan(future::multisession, workers = min(4, nrow(urls_dt)))
-    WQ_data_list <- furrr::future_pmap(
-      list(urls_dt$indv_url, urls_dt$data_type,
-           urls_dt$site_code, urls_dt$parameter_units),
-      process_urls_optimized,
-      .options = furrr::furrr_options(seed = TRUE)
-    )
-    future::plan(future::sequential)
-  } else {
+  # # Not sure if this works yet...
+  # is_shiny <- tryCatch({
+  #   shiny::isRunning()
+  # }, error = function(e) FALSE)
+  #
+  # # TODO: Test this in a shiny app, perhaps we add a T/F param to decide which method to use
+  # if (is_shiny) {
+  #   # Running in Shiny - use progress bar and sequential processing
+  #   progress <- shiny::Progress$new(session, min = 0, max = nrow(urls_dt))
+  #   progress$set(message = "Retrieving data...", value = 0)
+  #   on.exit(progress$close())
+  #
+  #   WQ_data_list <- vector("list", nrow(urls_dt))
+  #   for (i in seq_len(nrow(urls_dt))) {
+  #     progress$set(detail = paste("Processing", urls_dt$data_type[i]), value = i)
+  #     WQ_data_list[[i]] <- process_urls_optimized(
+  #       urls_dt$indv_url[i],
+  #       urls_dt$data_type[i],
+  #       urls_dt$site_code[i],
+  #       urls_dt$parameter_units[i]
+  #     )
+  #   }
+  # } else if (requireNamespace("future", quietly = TRUE) && requireNamespace("furrr", quietly = TRUE)) {
+  #   # Not in Shiny - use parallel processing if available
+  #   future::plan(future::multisession, workers = min(4, nrow(urls_dt)))
+  #   WQ_data_list <- furrr::future_pmap(
+  #     list(urls_dt$indv_url, urls_dt$data_type,
+  #          urls_dt$site_code, urls_dt$parameter_units),
+  #     process_urls_optimized,
+  #     .options = furrr::furrr_options(seed = TRUE)
+  #   )
+  #   future::plan(future::sequential)
+  # } else {
     # Sequential processing
     WQ_data_list <- pmap(
       list(urls_dt$indv_url, urls_dt$data_type,
            urls_dt$site_code, urls_dt$parameter_units),
       process_urls_optimized)
-  }
+  #}
 
   # Remove NULL results
   WQ_data_list <- WQ_data_list[!sapply(WQ_data_list, is.null)]
