@@ -14,6 +14,8 @@ package_loader <- function(x) {
   }
 }
 
+
+
 invisible(
   lapply(c(
     # Core data manipulation
@@ -21,6 +23,7 @@ invisible(
     "data.table",
     "arrow",
     "furrr",
+    "fcw.qaqc",
     # Date/time handling
     "zoo",
     "padr",
