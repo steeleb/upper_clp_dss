@@ -1,0 +1,89 @@
+---
+title: "Colocation differences"
+author: "Sam Struthers"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+#load all packages and themes
+source("src/setup_libraries.R")
+
+```
+
+Re run workflow design prior to this to load `data/sensors/uclp_sensor_raw.parquet` as needed
+
+## Load raw data
+
+```{r}
+list.files(path = here("data", "upper_clp_dss" , "sensor"), pattern = ".parquet", full.names = T)
+
+all_data_raw <- read_parquet("data/upper_clp_dss/sensor/uclp_sensor_raw_2025-03-26_2025-07-09.parquet")
+
+```
+
+# Comparison Plots
+
+```{r}
+subset <- all_data_raw %>% 
+  filter(!is.na(mean),
+         site %in% c("pbr", "pbr_fc"),
+         parameter %nin% c("FDOM Fluorescence", "ORP", "Depth"))%>%
+  mutate(site = ifelse(site == "pbr", "PBR ROSS", "PBR FC"))
+
+parameters = unique(subset$parameter)
+plot_list <- list()
+
+for(param in parameters){
+  
+#TODO: add in grab samples as "truth" for SC, Turb, pH and chla (may want to normalize chla before hand)
+  
+  data_plot <- ggplot(subset%>%filter(parameter == param), aes(x = DT_round_MT, y = mean, color = site)) +
+        geom_line()+
+        labs(title = paste("Comparison of PBR ROSS and PBR FC", param),
+             x = "Date",
+             y = param, 
+             color = "Site")+
+    scale_color_manual(values = ROSS_lt_pal)+
+    ROSS_theme
+
+  comp_data <- subset %>%
+  pivot_wider(id_cols = c(parameter, DT_round_MT), 
+              names_from = site, 
+              values_from = mean) %>%
+  mutate(difference =  `PBR ROSS`- `PBR FC`,
+         percent_difference = (`PBR ROSS`- `PBR FC`) / `PBR FC` * 100, 
+         cat = case_when(percent_difference > 0 ~  "PBR ROSS > PBR FC", 
+                         percent_difference < 0 ~ "PBR ROSS < PBR FC", 
+                         percent_difference == 0 ~ "Equal",
+                         is.na(percent_difference) ~ "No Data"))
+  
+  comp_plot_abs <- ggplot(comp_data%>%filter(parameter == param), aes(x = DT_round_MT, y = difference, color = cat)) +
+    geom_point() +
+    geom_hline(yintercept = 0, linetype = "solid", color = "black") +
+    labs(x = "", 
+         y = paste0("Absolute Difference for ", param), 
+         color = "Difference Category") +
+    scale_color_manual(values = ROSS_acc_pal)+
+    ROSS_theme
+  
+  comp_plot_perc <- ggplot(comp_data%>%filter(parameter == param), aes(x = DT_round_MT, y = percent_difference, color = cat)) +
+    geom_point() +
+    geom_hline(yintercept = 0, linetype = "solid", color = "black") +
+    labs(x = "Date",
+         y = paste0("Percent Difference for ", param ), 
+         color = "Difference Category") +
+    scale_color_manual(values = ROSS_acc_pal)+
+    ROSS_theme
+      
+  plot_list[[param]] <- data_plot+ comp_plot_abs+ comp_plot_perc +
+                                   plot_layout(ncol = 1, nrow = 3, 
+                                    guides = "collect")
+  
+  
+}
+
+print(plot_list)
+      
+```
