@@ -1,33 +1,74 @@
-#Protoype dashboard
+#Prototype dashboard
+# Fixed package loading for shinyapps.io deployment
+# Remove the custom package_loader function and install.packages() calls
 
-library(shinydashboard)
-library(shinyWidgets)
-library(shinycssloaders)
-library(shiny)
-library(dplyr)
-library(lubridate)
-library(readr)
-library(yaml)
-library(ggplot2)
-library(tidyverse)
-library(rsconnect)
-library(bslib)
-library(plotly)
-library(cdssr)
-library(dataRetrieval)
-library(patchwork)
-library(shinyTime)
-library(DT)
-library(leaflet)
-library(htmltools)
-library(arrow)
+# Simply load required packages - shinyapps.io will automatically detect and install them
+suppressMessages({
+  # Core data manipulation
+  library(tidyverse)
+  library(data.table)
+  library(arrow)
+  library(furrr)
+#  library(fcw.qaqc)
+  # Date/time handling
+  library(zoo)
+  library(padr)
+  # Data cleaning and utilities
+  library(janitor)
+  library(broom)
+  library(here)
+  # Stats/modeling
+  library(stats)
+  library(RcppRoll)
+  library(trend)
+ # library(xgboost)
+  library(scales)
+  # Spatial packages
+  library(sf)
+  library(nhdplusTools)
+  library(leaflet)
+  library(tmap)
+  library(mapview)
+  # Vis
+  library(ggpubr)
+  library(ggthemes)
+  library(scales)
+  library(plotly)
+  library(ggpmisc)
+  library(DT)
+  # Web scraping/data retrieval
+  library(rvest)
+  library(httr)
+  library(httr2)
+  library(rjson)
+  library(jsonlite)
+  library(dataRetrieval)
+  library(RSelenium)
+  library(cdssr)
+  library(yaml)
+  # Development tools
+  library(devtools)
+  # Shiny
+  library(shiny)
+  library(shinycssloaders)
+  library(rsconnect)
+  library(shinyTime)
+  library(bslib)
+  library(shinyWidgets)
+  library(shinydashboard)
+  library(htmltools)
+})
+
+# Set up
 options(shiny.maxRequestSize = 10000 * 1024^2)
+
+`%nin%` = Negate(`%in%`)
 
 site_table <- tibble(site_code = c("sfm", "chd", "pfal", "pbd", "pbr_fc", "pman_fc"),
                      site_name = c("South Fork CLP", "Chambers Lake Outflow", "CLP @ Poudre Falls", "Canyon Mouth", "CLP @ Indian Meadows", "CLP @ Manners Bridge"),
                      color = c("#002EA3", "#E70870", "#256BF5", "#1E4D2B", "#56104E", "#FFCA3A"))
-# Source setup and functions (assuming these exist)
-source("src/setup_libraries.R")
+# Source setup and functions
+#source("src/setup_libraries.R")
 
 # Define UI
 ui <- dashboardPage(
@@ -185,7 +226,7 @@ sites_sel <- filter(site_table, site_name %in% input$sites_select )%>%
 
 
     # Sample site locations
-    values$site_locations <- read_csv(here("data", "metadata", "sonde_location_metadata.csv"), show_col_types = F) %>%
+    values$site_locations <- read_csv(here( "metadata", "sonde_location_metadata.csv"), show_col_types = F) %>%
       separate(col = "lat_long", into = c("lat", "lon"), sep = ",", convert = TRUE) %>%
       st_as_sf(coords = c("lon", "lat"), crs = 4326) %>%
       mutate(site = tolower(Site),
@@ -221,7 +262,7 @@ sites_sel <- filter(site_table, site_name %in% input$sites_select )%>%
 
       incProgress(0.2, detail = "Connecting to WET API...")
 
-      source("src/pull_wet_api.R")
+      #source("src/pull_wet_api.R")
 
       wet_data <- map(sites,
                       ~pull_wet_api(
@@ -248,17 +289,17 @@ sites_sel <- filter(site_table, site_name %in% input$sites_select )%>%
         sites <- c("pbd")
 
         # source scripts to pull Hydro Vu
-        walk(list.files('src/fcw_QAQC_func/', pattern = "*.R", full.names = TRUE, recursive = TRUE), source)
+        #walk(list.files('src/fcw_QAQC_func/', pattern = "*.R", full.names = TRUE, recursive = TRUE), source)
 
         incProgress(0.4, detail = "Connecting to Hydro Vu API...")
-        # Set up parallel processing
-        num_workers <- min(availableCores() - 1, 4) # Use at most 4 workers
-        plan(multisession, workers = num_workers)
-        furrr_options(
-          globals = TRUE,
-          packages = c("arrow", "data.table", "httr2", "tidyverse", "lubridate", "zoo",
-                       "padr", "stats", "RcppRoll", "yaml", "here", "fcw.qaqc")
-        )
+        # # Set up parallel processing
+        # num_workers <- min(availableCores() - 1, 4) # Use at most 4 workers
+        # plan(multisession, workers = num_workers)
+        # furrr_options(
+        #   globals = TRUE,
+        #   packages = c("arrow", "data.table", "httr2", "tidyverse", "lubridate", "zoo",
+        #                "padr", "stats", "RcppRoll", "yaml", "here", "fcw.qaqc")
+        # )
 
         # suppress scientific notation to ensure consistent formatting
         options(scipen = 999)
@@ -267,7 +308,7 @@ sites_sel <- filter(site_table, site_name %in% input$sites_select )%>%
         staging_directory = tempdir()
 
         # Read in credentials
-        hv_creds <- read_yaml(here("data", "upper_clp_dss", "creds", "HydroVuCreds.yml"))
+        hv_creds <- read_yaml(here("creds", "HydroVuCreds.yml"))
         hv_token <- hv_auth(client_id = as.character(hv_creds["client"]),
                             client_secret = as.character(hv_creds["secret"]))
 
@@ -301,7 +342,7 @@ sites_sel <- filter(site_table, site_name %in% input$sites_select )%>%
             return(site_df)
           }) %>%
           #doing some clean up
-          select(-id) %>%
+          dplyr::select(-id) %>%
           mutate(units = as.character(units)) %>%
           #double check that Vulink data has been removed
           filter(!grepl("vulink", name, ignore.case = TRUE)) %>%
@@ -311,7 +352,7 @@ sites_sel <- filter(site_table, site_name %in% input$sites_select )%>%
             #DT_round_MT = with_tz(DT_round, tzone = "America/Denver"),
             DT_join = as.character(DT_round), #keeping in UTC but character form
             site = tolower(site)) %>%
-          select(-name) %>%
+          dplyr::select(-name) %>%
           distinct(.keep_all = TRUE) %>%
           split(f = list(.$site, .$parameter), sep = "-") %>%
           keep(~nrow(.) > 0)
@@ -324,7 +365,7 @@ sites_sel <- filter(site_table, site_name %in% input$sites_select )%>%
       #check to see if we need to access contrail
       if(any(c("pbr_fc", "pman_fc") %in% sites_sel)) {
         incProgress(0.7, detail = "Connecting to Contrail API...")
-        source("src/pull_contrail_api.R")
+        #source("src/pull_contrail_api.R")
 
         # Define sites to pull data for
         contrail_sites <- c("pbr_fc", "pman_fc")
@@ -339,7 +380,7 @@ sites_sel <- filter(site_table, site_name %in% input$sites_select )%>%
       username <- as.character(creds["username"])
       password <- as.character(creds["password"])
 
-      contrail_api_urls <- read_csv(here("data","upper_clp_dss", "creds", "contrail_device_urls.csv"), show_col_types = F)%>%
+      contrail_api_urls <- read_csv(here("creds", "contrail_device_urls.csv"), show_col_types = F)%>%
         filter(site_code %in% trim_sites)
       # Define the folder path where the CSV files are stored
       # Call the downloader function
@@ -386,7 +427,7 @@ sites_sel <- filter(site_table, site_name %in% input$sites_select )%>%
       #TODO: check in with FC about their field note taking so we can try to add that in later on
 
       combined_data <- tidy_data %>%
-        future_map(~add_field_notes(df = ., notes = all_field_notes), .progress = TRUE)
+        map(~add_field_notes(df = ., notes = all_field_notes), .progress = TRUE)
 
       # # Add summary statistics
       summarized_data <- combined_data %>%
@@ -503,7 +544,7 @@ sites_sel <- filter(site_table, site_name %in% input$sites_select )%>%
       parameter <- input$parameters_select[i]
       plot_id <- paste0("time_series_plot_", i)
 
-      #browser()
+
       output[[plot_id]] <- renderPlotly({
         # Filter data for this specific parameter
         plot_data <-  filtered_data() %>%
@@ -595,7 +636,7 @@ sites_sel <- filter(site_table, site_name %in% input$sites_select )%>%
 
                 current_flow <- iv_data %>%
                   arrange(DT_round) %>%
-                  slice(n()) %>%
+                  dplyr::slice(n()) %>%
                   pull(flow)
 
                 site_row %>%
@@ -607,7 +648,7 @@ sites_sel <- filter(site_table, site_name %in% input$sites_select )%>%
                                     if_else(flow_slope > 0, "increasing", "decreasing")),
                     nested_data = list(flow_data)
                   )%>%
-                  select(abbrev, station_name, data_source, water_source, gnis_id, latitude, longitude,
+                  dplyr::select(abbrev, station_name, data_source, water_source, gnis_id, latitude, longitude,
                          current_flow_cfs, flow_slope, trend, structure_type, site_type = station_type, nested_data)
               } else {
                 tibble()
@@ -807,7 +848,7 @@ sites_sel <- filter(site_table, site_name %in% input$sites_select )%>%
 
     # Reshape the data from wide to long format
     clp_snotel_non_stats <- clp_snotel_data %>%
-      select(-c("10.", "30.", "70.", "90.", "Min", "Median...91..20.", "Median..POR.", "Max", "Median.Peak.SWE" ))%>%
+      dplyr::select(-c("10.", "30.", "70.", "90.", "Min", "Median...91..20.", "Median..POR.", "Max", "Median.Peak.SWE" ))%>%
       pivot_longer(
         cols = -date,
         names_to = "year",
@@ -823,7 +864,7 @@ sites_sel <- filter(site_table, site_name %in% input$sites_select )%>%
 
     curr_year <- clp_snotel_non_stats%>%
       filter(year == as.character(cur_year))%>%
-      select(date, swe, full_date)
+      dplyr::select(date, swe, full_date)
 
     cur_swe <- curr_year%>%
       filter(full_date == Sys.Date())%>%
@@ -831,13 +872,13 @@ sites_sel <- filter(site_table, site_name %in% input$sites_select )%>%
 
     recent_years <- clp_snotel_non_stats%>%
       filter(year <= as.character(cur_year-1) & year >= as.character(cur_year-6))%>%
-      select(date, swe, full_date, year)
+      dplyr::select(date, swe, full_date, year)
 
 
 
     # Extract statistical columns
     stats_data <- clp_snotel_data %>%
-      select(date, "10.", "30.", "70.", "90.", "Min", "Median...91..20.", "Median..POR.", "Max", "Median.Peak.SWE" )%>%
+      dplyr::select(date, "10.", "30.", "70.", "90.", "Min", "Median...91..20.", "Median..POR.", "Max", "Median.Peak.SWE" )%>%
       pivot_longer(
         cols = -date,
         names_to = "stat",
@@ -869,7 +910,7 @@ sites_sel <- filter(site_table, site_name %in% input$sites_select )%>%
     # grab the median peak swe stat
     median_peak = clp_snotel_data %>%
       filter(!is.na(`Median.Peak.SWE`))%>%
-      select(date, med_peak_swe = `Median.Peak.SWE`)%>%
+      dplyr::select(date, med_peak_swe = `Median.Peak.SWE`)%>%
       mutate(month_day = date,
              date = ymd(paste0("2000-", date)),
              full_date = if_else(
@@ -1006,7 +1047,7 @@ sites_sel <- filter(site_table, site_name %in% input$sites_select )%>%
 
 
   output$clp_rainbow_plot <- renderPlotly({
-    source("src/create_rainbow_flow_plot.R")
+    #source("src/create_rainbow_flow_plot.R")
 
     plot_title <- cdssr::get_sw_stations(abbrev = input$site_abbrev_selected)%>%
       pull(station_name)%>%
