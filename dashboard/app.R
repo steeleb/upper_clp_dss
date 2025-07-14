@@ -6,9 +6,10 @@
 suppressMessages({
   # Core data manipulation
   library(tidyverse)
+  library(purrr)
   library(data.table)
   library(arrow)
-  library(furrr)
+  #library(furrr)
 #  library(fcw.qaqc)
   # Date/time handling
   library(zoo)
@@ -57,6 +58,7 @@ suppressMessages({
   library(shinyWidgets)
   library(shinydashboard)
   library(htmltools)
+  library(readr)
 })
 
 # Set up
@@ -226,7 +228,7 @@ sites_sel <- filter(site_table, site_name %in% input$sites_select )%>%
 
 
     # Sample site locations
-    values$site_locations <- read_csv(here( "metadata", "sonde_location_metadata.csv"), show_col_types = F) %>%
+    values$site_locations <- read_csv("metadata/sonde_location_metadata.csv", show_col_types = F) %>%
       separate(col = "lat_long", into = c("lat", "lon"), sep = ",", convert = TRUE) %>%
       st_as_sf(coords = c("lon", "lat"), crs = 4326) %>%
       mutate(site = tolower(Site),
@@ -308,7 +310,7 @@ sites_sel <- filter(site_table, site_name %in% input$sites_select )%>%
         staging_directory = tempdir()
 
         # Read in credentials
-        hv_creds <- read_yaml(here("creds", "HydroVuCreds.yml"))
+        hv_creds <- read_yaml("creds/HydroVuCreds.yml")
         hv_token <- hv_auth(client_id = as.character(hv_creds["client"]),
                             client_secret = as.character(hv_creds["secret"]))
 
@@ -375,12 +377,12 @@ sites_sel <- filter(site_table, site_name %in% input$sites_select )%>%
         trim_sites <- toupper(gsub("_fc", "", sites))
 
       # Read credentials
-      creds <- yaml::read_yaml(here("creds","contrail_creds.yml")) %>%
+      creds <- yaml::read_yaml("creds/contrail_creds.yml") %>%
         unlist()
       username <- as.character(creds["username"])
       password <- as.character(creds["password"])
 
-      contrail_api_urls <- read_csv(here("creds", "contrail_device_urls.csv"), show_col_types = F)%>%
+      contrail_api_urls <- read_csv("creds/contrail_device_urls.csv", show_col_types = F)%>%
         filter(site_code %in% trim_sites)
       # Define the folder path where the CSV files are stored
       # Call the downloader function
@@ -410,7 +412,7 @@ sites_sel <- filter(site_table, site_name %in% input$sites_select )%>%
 
       #add field notes
       # Pulling in the data from mWater (where we record our field notes)
-      mWater_creds <- read_yaml(here("creds", "mWaterCreds.yml"))
+      mWater_creds <- read_yaml("creds/mWaterCreds.yml")
       mWater_data <- load_mWater(creds = mWater_creds)
       all_field_notes <- grab_mWater_sensor_notes(mWater_api_data = mWater_data) %>%
         #notes come in as MST, converting to UTC
@@ -556,13 +558,15 @@ sites_sel <- filter(site_table, site_name %in% input$sites_select )%>%
         log_input_id <- paste0("log_", gsub("[^A-Za-z0-9]", "_", tolower(parameter)))
         use_log <- if (!is.null(input[[log_input_id]])) input[[log_input_id]] else FALSE
 
+        #set consistent colors for cplotting by site
+        color_mapping <- setNames(site_table$color, site_table$site_code)
         # Create the plotly plot
         p <- plot_ly(plot_data,
                      x = ~DT_round_MT,
                      y = ~mean,
                      type = "scatter",
                      color = ~site,
-                     colors = ~color,
+                     colors = color_mapping,
                      mode = "lines+markers",
                      name = ~site_name) %>%
           layout(
