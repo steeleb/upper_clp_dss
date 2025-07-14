@@ -165,7 +165,7 @@ pull_contrail_api <- function(start_DT, end_DT = Sys.time(), username, password,
                DT_join = as.character(DT_round), # Create a character version of the UTC time
                parameter = parameter, # Add the parameter
                site = paste0(tolower(site_code), "_fc")) %>% # note that the site is managed by Fort Collins
-          select(DT_round, DT_round_MT, DT_join, parameter, site,
+          dplyr::select(DT_round, DT_round_MT, DT_join, parameter, site,
                   value = Value, units = Unit) #fix names to match other API sources
 
         return(parsed_data)
