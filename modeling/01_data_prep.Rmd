@@ -147,22 +147,20 @@ saveRDS(all_sensor_data_wide, "data/sensor/prepped/all_sensor_data.rds")
 
 #discrete sample data and location metadata from most recent pub
 
+source("src/pull_ROSS_zenodo_data.R")
+zenodo_data <- pull_ROSS_zenodo_data(data_version = "v2025.07.01", DOI = "15883685", save_folder_dir = "data/upper_clp_dss/ross_clp_chem")
 
-DOI = "14397591"
-data_version = "v.2024.12.10"
+# Grab the water chemistry dataset
 
-
-source("src/grab_zenodo_data.R")
-
-
-ross_water_chem <- most_recent_chem%>%
+ross_water_chem <- zenodo_data[["most_recent_chem"]]%>%
   mutate(site_code = tolower(site_code), 
-         site_code = case_when(site_code == "archery" ~ "archery virridy",
-                          site_code == "timberline" ~ "timberline virridy",
-                          site_code == "prospect" ~ "prospect virridy",
+         #fixing site names based on sonde deployments with ROSS/Virridy sondes
+         site_code = case_when(site_code == "archery" & DT_mst <= ymd("2024-11-30") ~ "archery virridy",
+                          site_code == "timberline" & DT_mst <= ymd("2024-11-30") ~ "timberline virridy",
+                          site_code == "prospect" & DT_mst <= ymd("2024-11-30") ~ "prospect virridy",
                           T ~ site_code))%>%
   filter(site_code %in% unique(all_sensor_data$site) & DT_mst >= as_date("2023-09-01"))%>%
-  select(site_code, 
+  dplyr::select(site_code, 
          Date, 
          DT_sample = DT_mst,
          TOC, TN, DOC, ChlA, NO3, NH4, PO4, SC,Cl, lab_turb = Turbidity, TSS,DT_mst_char)%>%
@@ -172,8 +170,8 @@ ross_water_chem <- most_recent_chem%>%
 ## FC
 ```{r}
 
-FC_chem <- read_csv("data/FC_clp_chem/UCLP_CWQMP_database_2022-24.csv", show_col_types = F)%>%
-  select(site_code = ShortDesc, 
+FC_chem <- read_csv("data/upper_clp_dss/fc_clp_chem/UCLP_CWQMP_database_2022-24.csv", show_col_types = F)%>%
+  dplyr::select(site_code = ShortDesc, 
          Date, 
          Cl, 
          TOC, NO3_N, 
@@ -197,11 +195,14 @@ FC_chem <- read_csv("data/FC_clp_chem/UCLP_CWQMP_database_2022-24.csv", show_col
          #NEED TO GET READ DT
          DT_sample = ymd_hm(paste0(Date, " 12:00"), tz = "America/Denver"), 
          DT_mst_char = as.character(DT_sample))%>%
-  select(site_code, 
+  dplyr::select(site_code, 
          Date, 
          DT_sample,
          TOC, TN, DOC, ChlA, NO3, NH4, PO4, SC,Cl, lab_turb, TSS,DT_mst_char)%>%
   mutate(collector = "FC")
+
+
+
 
 #write_csv(FC_chem, "data/FC_clp_chem/FC_testing_data.csv")
 ```
