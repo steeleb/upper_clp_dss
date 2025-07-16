@@ -10,7 +10,7 @@ suppressMessages({
   library(data.table)
   library(arrow)
   #library(furrr)
-#  library(fcw.qaqc)
+  library(fcw.qaqc)
   # Date/time handling
   library(zoo)
   library(padr)
@@ -383,13 +383,14 @@ sites_sel <- filter(site_table, site_name %in% input$sites_select )%>%
       password <- as.character(creds["password"])
 
       contrail_api_urls <- read_csv("creds/contrail_device_urls.csv", show_col_types = F)%>%
-        filter(site_code %in% trim_sites)
+        dplyr::filter(site_code %in% trim_sites)
       # Define the folder path where the CSV files are stored
       # Call the downloader function
       contrail_data <- pull_contrail_api(start_DT, end_DT, username, password, contrail_api_urls) %>%
         rbindlist() %>%
         split(f = list(.$site, .$parameter), sep = "-") %>%
         keep(~nrow(.) > 0)
+
       }else{
         contrail_data <- list()
       }
@@ -400,10 +401,16 @@ sites_sel <- filter(site_table, site_name %in% input$sites_select )%>%
       # combine all data
       all_data_raw <- c(hv_data, wet_data, contrail_data)
 
+
       # remove stage data
       list_names <- names(all_data_raw)
       keep_indices <- !grepl("stage", list_names, ignore.case = TRUE)
       all_data_raw <- all_data_raw[keep_indices]
+
+#TODO: Add in failsafe if there is no data
+if(length(all_data_raw) == 0){
+  stop("No data found for the selected sites and date range.")
+}
 
       # Tidy all the raw files
       tidy_data <- all_data_raw %>%
