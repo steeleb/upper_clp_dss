@@ -151,9 +151,10 @@ pull_wet_api <- function(target_site, start_datetime, end_datetime = Sys.time(),
   if (time_window == "2 hours") {
     increments_since_now <- 10 # 2 hours = 8 increments of 15 minutes + 2 additional in case of repeats or errors
   } else {
-    # Otherwise get the difference between now and the start time to calculate the # of intervals we need to query (15 min data = 4 per hour)
+    # Otherwise get the difference between now and the start time to calculate the # of intervals we need to query
+    # For safer performance do 12 intervals per hour (5 min data) in the event of errors with radio system
     increments_since_now <- round(as.numeric(difftime(with_tz(Sys.time() + hours(1), tzone = "America/Denver"),
-                                                      start_datetime, units = "hours")) * 4, digits = 0)
+                                                      start_datetime, units = "hours")) * 12, digits = 0)
   }
 
   # Create URLs to look up for site
