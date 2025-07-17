@@ -40,7 +40,7 @@ fix_sites <- function(df) {
 
 ```{r}
 site_levels <- c("salyer", "udall", "riverbend", "cottonwood","riverbend_virrridy", "cottonwood_virridy", "elc",
-                 "archery", "archery_virridy" ,  "riverbluffs", "joei", "cbri", "chd", "pfal", "sfm", "pbd", "penn", "lbea", "springcreek", "boxcreek")
+                 "archery", "archery_virridy" ,  "riverbluffs", "joei", "cbri", "chd", "pfal", "sfm", "pbr", "pman", "pbd", "penn", "lbea", "springcreek", "boxcreek")
 
 parameter_levels <- c("Chl-a Fluorescence", "Depth", "DO", "ORP", "pH","Specific Conductivity", "Temperature", "Turbidity", "FDOM Fluorescence") 
 
@@ -611,7 +611,7 @@ all_sensor_data <- bind_rows(all_data_2023, all_data_2024, all_data_2025)%>%
 #
 all_sensor_data%>%
   filter(parameter == "FDOM Fluorescence")%>%
-  filter( site %in% c("pbd","udall", "cottonwood"))%>%
+  filter( site %in% c("pbr","udall", "cottonwood"))%>%
   ggplot(aes(x = DT_round, y = value, color = flag))+
   geom_point()+
   facet_wrap( site ~ parameter, scales = "free_y")+
@@ -648,4 +648,12 @@ max_date = format(max(all_sensor_data_wide$DT_round, na.rm = TRUE), "%Y-%m-%d")
 write_parquet(all_sensor_data_wide, paste0("data/upper_clp_dss/sensor/prepped/all_sensor_data_",min_date, "_", max_date,".parquet"))
 ```
 
+
+## FC Sensor Data
+
+TODO:
+- Read in 2023-2024 historical data (chl-a not livestreaming). 
+
+
+- Read in 2025
 
