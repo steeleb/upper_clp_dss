@@ -33,6 +33,19 @@ fix_sites <- function(df) {
 
 ```
 
+# Read in sensor data
+
+This comes from the 01_sensor_data_prep.rmd script and should be updated when an API pull, QAQC is updated or as more data is verified. 
+
+```{r}
+
+#list.files(path = "data/upper_clp_dss/sensor/prepped/", full.names = TRUE)
+
+all_sensor_data_wide <- read_parquet(file = "data/upper_clp_dss/sensor/prepped/all_sensor_data_2023-09-01_2025-07-15.parquet")
+
+```
+
+
 # pull in grab sample data
 
 ## ROSS
@@ -49,11 +62,18 @@ zenodo_data <- pull_ROSS_zenodo_data(data_version = "v2025.07.01", DOI = "158836
 ross_water_chem <- zenodo_data[["most_recent_chem"]]%>%
   mutate(site_code = tolower(site_code), 
          #fixing site names based on sonde deployments with ROSS/Virridy sondes
-         site_code = case_when(site_code == "archery" & DT_mst <= ymd("2024-11-30") ~ "archery virridy",
-                          site_code == "timberline" & DT_mst <= ymd("2024-11-30") ~ "timberline virridy",
-                          site_code == "prospect" & DT_mst <= ymd("2024-11-30") ~ "prospect virridy",
+         site_code = case_when(site_code == "archery" & DT_mst <= ymd("2024-11-30") ~ "archery_virridy",
+                          site_code == "timberline" & DT_mst <= ymd("2024-11-30") ~ "riverbend_virridy",
+                          site_code == "prospect" & DT_mst <= ymd("2024-11-30") ~ "cottonwood_virridy",
+                          #updating to new names
+                          site_code == "timberline" & DT_mst >= ymd("2024-11-30") ~ "riverbend",
+                          site_code == "prospect" & DT_mst >= ymd("2024-11-30") ~ "cottonwood",
+                          site_code == "lincoln" ~ "udall", 
+                          site_code == "legacy" ~ "salyer",
+                          site_code == "boxelder" ~ "elc",
+                          site_code == "tamasag" ~ "bellvue",
                           T ~ site_code))%>%
-  filter(site_code %in% unique(all_sensor_data$site) & DT_mst >= as_date("2023-09-01"))%>%
+  filter(DT_mst >= as_date("2023-09-01"))%>%
   dplyr::select(site_code, 
          Date, 
          DT_sample = DT_mst,
@@ -70,41 +90,85 @@ This is given to us by the City of Fort Collins Watershed Team (Diana Schmidt an
 ```{r}
 
 FC_chem_2022_2024 <- read_csv("data/upper_clp_dss/fc_clp_chem/UCLP_CWQMP_database_2022-24.csv", show_col_types = F)%>%
-  dplyr::select(site_code = ShortDesc, 
-         Date, 
-         Cl, 
-         TOC, NO3_N, 
-         PO4 = oPhos,
-         TDS, 
-         TN = TN_calc,
-         lab_turb = Turbidity)%>%
   mutate(Date = as.POSIXct(Date, format = "%m/%d/%y"), 
          NO3 = NO3_N/ 0.2259, 
          SC = TDS/ 0.65, #converting TDS to SC
          Cl = as.numeric(Cl), 
-         lab_turb = as.numeric(lab_turb),
-         TN = as.numeric(TN),
+         lab_turb = as.numeric(Turbidity),
+         TN = as.numeric(TN_calc),
          ChlA = NA_integer_,
          DOC = NA_integer_, 
          NH4 = NA_integer_, 
-         TSS = NA_integer_
-         )%>%
-  filter(site_code %in% c("CHD", 'PBD', "SFM") & Date >= as_date("2023-09-01"))%>%
-  mutate(site_code = tolower(site_code), 
-         #NEED TO GET READ DT
-         DT_sample = ymd_hm(paste0(Date, " 12:00"), tz = "America/Denver"), 
-         DT_mst_char = as.character(DT_sample))%>%
-  dplyr::select(site_code, 
-         Date, 
-         DT_sample,
-         TOC, TN, DOC, ChlA, NO3, NH4, PO4, SC,Cl, lab_turb, TSS,DT_mst_char)%>%
+         TSS = NA_integer_,
+         site_code = tolower(ShortDesc))%>%
+  #filter to the period of our sensor deployment and sites where we have sensors
+  filter(site_code %in% c("chd", 'pbd', "sfm") & Date >= as_date("2023-09-01"))%>%
+  #grab columns of interest
+  dplyr::select(site_code, Date,
+         TOC, TN, DOC, ChlA, NO3, NH4, PO4 = oPhos, SC,Cl, lab_turb, TSS)%>%
   mutate(collector = "FC")
 
+FC_field_data_2022_2024 <- readxl::read_xlsx(path = "data/upper_clp_dss/fc_clp_chem/UCLP_field_data_2022-24.xlsx")%>%
+  mutate(
+    Date = as.Date(`Date (MM/DD/YYYY)`),
+    # Combine date and time into one datetime column from MT to MST for consistency 
+    dt_mst = with_tz(ymd_hms(paste(
+      format(`Date (MM/DD/YYYY)`, "%Y-%m-%d"), 
+      format(`Time (HH:MM:SS)`, "%H:%M:%S")
+    ), tz = "America/Denver"), tzone = "MST"),
+    # Remove numbers from site name
+    site_code = tolower(gsub("\\d+", "", `Site Name`)), 
+    DT_mst_char = as.character(dt_mst)
+  )%>%
+  dplyr::select(site_code, Date, DT_sample = dt_mst, DT_mst_char)
+  
+# Combine the chemistry data with the field data
+FC_chem_2022_2024 <- FC_chem_2022_2024 %>%
+  left_join(FC_field_data_2022_2024, by = c("site_code", "Date")) 
 
 
+# Repeat for 2025 data (TOC only!)
+
+FC_chem_2025 <- readxl::read_xlsx("data/upper_clp_dss/fc_clp_chem/UCLP_CWQMP_TOC_202504-202506.xlsx")%>%
+  filter(grepl(x = `Parameter Name`, pattern = "Total Organic Carbon", ignore.case = TRUE), 
+          `Entered Unit` == "mg/L",
+         grepl(x = `Location Name`, pattern = "CHD|PBD|SFM|PBR", ignore.case = TRUE))%>%
+  dplyr::select(
+    Date = `Sampled Date`, 
+    site_name = `Location Name`,
+    value = `Corrected Result`
+  )%>%
+  mutate(site_code = case_when(
+    grepl("PBR", site_name, ignore.case = TRUE) ~ "pbr",
+    grepl("CHD", site_name, ignore.case = TRUE) ~ "chd",
+    grepl("PBD", site_name, ignore.case = TRUE) ~ "pbd",
+    grepl("SFM", site_name, ignore.case = TRUE) ~ "sfm",
+    TRUE ~ NA_character_),
+         TOC = as.numeric(value))%>%
+  mutate(collector = "FC")%>%
+  dplyr::select(site_code, Date, TOC, collector)
+
+FC_field_data_2025 <- readxl::read_xlsx(path = "data/upper_clp_dss/fc_clp_chem/UCLP_field_data_04-062025.xlsx")%>%
+  mutate(
+    Date = as.Date(`Date (MM/DD/YYYY)`),
+    # Combine date and time into one datetime column from MT to MST for consistency 
+    dt_mst = with_tz(ymd_hms(paste(
+      format(`Date (MM/DD/YYYY)`, "%Y-%m-%d"), 
+      format(`Time (HH:MM:SS)`, "%H:%M:%S")
+    ), tz = "America/Denver"), tzone = "MST"),
+    # Remove numbers from site name
+    site_code = tolower(gsub("\\d+", "", `Site Name`)), 
+    DT_mst_char = as.character(dt_mst)
+  )%>%
+  dplyr::select(site_code, Date, DT_sample = dt_mst, DT_mst_char)
 
 
+FC_chem_2025 <- FC_chem_2025 %>%
+  left_join(FC_field_data_2025, by = c("site_code", "Date"))%>%
+  na.omit()
 
+
+FC_chem <- bind_rows(FC_chem_2022_2024, FC_chem_2025)
 
 
 #write_csv(FC_chem, "data/FC_clp_chem/FC_testing_data.csv")
@@ -113,32 +177,31 @@ FC_chem_2022_2024 <- read_csv("data/upper_clp_dss/fc_clp_chem/UCLP_CWQMP_databas
 ## Combine data
 ```{r}
 
-water_chem <- bind_rows(ross_water_chem, FC_chem)
+water_chem <- bind_rows(ross_water_chem, FC_chem)%>%
+  filter(site_code %in% unique(all_sensor_data_wide$site))
+
+# ggplot(water_chem%>%
+#          filter(site_code %in% c("sfm", "chd", "pbr")), aes(x = Date, y = TOC, color = collector)) +
+#   geom_point() +
+#   geom_line()+
+#   facet_wrap(~site_code, scales = "free_y") +
+#   labs(title = "Water Chemistry Data from Ross and FC",
+#        x = "Date",
+#        y = "TOC (mg/L)") +
+#   theme_minimal()
 
 ```
 
 ## plot available data vs water chem
 
 ```{r}
-# all_sensor_data_wide%>%
-#   filter(year(DT_round) == 2024)%>%
-#   ggplot(aes(x = DT_round, y = data_avail))+
-#   geom_point()+
-#   #create a vertical line when a sample from water chem was collected
-#   geom_vline(data = water_chem%>%rename(site = site_code)%>%filter(year(Date) == 2024), aes(xintercept = DT_sample), color = "red")+
-#   facet_wrap(~site, scales = "free_y")
-
-```
-
-# Read in sensor data
-
-This comes from the 01_sensor_data_prep.rmd script and should be updated when an API pull, QAQC is updated or as more data is verified. 
-
-```{r}
-
-#list.files(path = "data/upper_clp_dss/sensor/prepped/", full.names = TRUE)
-
-all_sensor_data_wide <- read_parquet(file = "data/upper_clp_dss/sensor/prepped/all_sensor_data_2023-09-01_2025-07-15.parquet")
+all_sensor_data_wide%>%
+  #filter(year(DT_round) == 2025)%>%
+  ggplot(aes(x = DT_round, y = data_avail))+
+  geom_point()+
+  #create a vertical line when a sample from water chem was collected
+  geom_vline(data = water_chem%>%rename(site = site_code), aes(xintercept = DT_sample), color = "red")+
+  facet_wrap(~site, scales = "free_y")
 
 ```
 
@@ -212,10 +275,6 @@ get_most_recent_sensor_data <- function(water_chem, all_sensor_data_wide) {
 
 # Apply the function to get the most recent sensor data for each water chemistry sample
 final_data <- get_most_recent_sensor_data(water_chem, all_sensor_data_wide)%>%
-  filter(!is.na(DT_round))%>%
-  #select(site, DT_sample, DT_round)%>%
-  #calc difference
-  #mutate(diff = as.numeric(difftime(DT_round, DT_sample, units = "hours")))
   dplyr::select(mw_id = site_code, 
          sensor_datetime = DT_round, 
          lab_datetime = DT_sample,
@@ -231,18 +290,21 @@ final_data <- get_most_recent_sensor_data(water_chem, all_sensor_data_wide)%>%
 
 ```
 
-### plot match up data set
+# Check Matches
+
+- We are losing quite a few samples for periods that have not been verified yet. In particular, we are missing a lot of samples from CHD, SFM and Udall in 2024. It is likely worth looking into which flags we can generally ignore to give ourselves more data before everything is completely manually verified. 
+
 
 ```{r}
-  ggplotly(ggplot()+
-  geom_point(data = water_chem %>% rename(mw_id = site_code), aes(x = DT_sample, y = TOC), color = "grey")+
-  geom_point(data = final_data, aes(x = lab_datetime, y = TOC, color = mw_id, shape = collector)))
-  
+# Count of how many did not match (sensor_datetime is NA)
+final_data %>%
+  filter(!is.na(TOC)) %>%
+  mutate(year = year(lab_datetime))%>%
+  group_by(year, mw_id) %>%
+  summarise(n_missing = sum(is.na(sensor_datetime)), .groups = "drop")%>%
+  arrange(desc(n_missing))
 
-#+
-  #geom_smooth(method = "loess")+
-  theme_minimal()+
-  facet_wrap(~mw_id, scales = "free_y")
+
 ```
 
 
@@ -251,7 +313,7 @@ final_data <- get_most_recent_sensor_data(water_chem, all_sensor_data_wide)%>%
 
 ```{r}
 
-virridy_data <- read_csv("data/parsed_data_virridy.csv")%>%
+virridy_data <- read_csv("data/upper_clp_dss/modeling/parsed_data_virridy.csv")%>%
   dplyr::select(-"...1" )%>%
   mutate(mw_id = as.character(mw_id))%>%
   mutate(collector = "Virridy")
@@ -261,6 +323,8 @@ ross_sites <- tibble(mw_id = unique(final_data$mw_id))%>%
   mutate(id = sample(1:1000, nrow(.), replace = TRUE))
 
 ROSS_model_data <- final_data%>%
+  #removing samples with no match up
+  filter(!is.na(sensor_datetime))%>%
   left_join(ross_sites, by = c("mw_id"))%>%
   mutate(sensor_datetime = as.character(sensor_datetime), 
          lab_datetime = as.character(lab_datetime), 
@@ -272,8 +336,8 @@ ROSS_model_data <- final_data%>%
 all_modeled_data <- ROSS_model_data%>%
   bind_rows(virridy_data)
 
-write_csv(ROSS_model_data, "data/parsed_data_ROSS.csv")
-write_csv(all_modeled_data, "data/parsed_data_ROSS_virridy.csv")
+write_csv(ROSS_model_data, "data/upper_clp_dss/modeling/parsed_data_ROSS.csv")
+write_csv(all_modeled_data, "data/upper_clp_dss/modeling/parsed_data_ROSS_virridy.csv")
 
 
 ```
