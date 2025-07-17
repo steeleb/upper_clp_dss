@@ -136,7 +136,7 @@ parse_insitu_html_log <- function(html_file_path) {
              DT = as.POSIXct(timestamp, tz = "UTC"),
              DT_round = floor_date(DT, unit = "15 minutes"),
              DT_join = as.character(DT_round))%>%
-      select(site, timestamp, parameter, value, units, DT, DT_round, DT_join)
+      dplyr::select(site, timestamp, parameter, value, units, DT, DT_round, DT_join)
 
 
     return(df_parsed)
