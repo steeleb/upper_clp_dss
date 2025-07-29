@@ -70,10 +70,12 @@
 #'
 #'
 
-pull_wet_api <- function(target_site, start_datetime, end_datetime = Sys.time(), data_type = "all", time_window = "2 hours") {
+pull_wet_api <- function(target_site, start_datetime, end_datetime = Sys.time(), data_type = "all", time_window = "all") {
 
-  # Helper function
-  `%nin%` <- Negate(`%in%`)
+
+  if (!exists("%nin%")) {
+    `%nin%` = Negate(`%in%`)
+  }
 
   # Pre-define constants to avoid repeated object creation
   sensor_numbers <- data.table(
@@ -149,7 +151,7 @@ pull_wet_api <- function(target_site, start_datetime, end_datetime = Sys.time(),
 
   # Calculate increments
   if (time_window == "2 hours") {
-    increments_since_now <- 10 # 2 hours = 8 increments of 15 minutes + 2 additional in case of repeats or errors
+    increments_since_now <- 26 # 2 hours = 24 increments of 5 minutes + 2 additional in case of repeats or errors
   } else {
     # Otherwise get the difference between now and the start time to calculate the # of intervals we need to query
     # For safer performance do 12 intervals per hour (5 min data) in the event of errors with radio system
@@ -174,104 +176,101 @@ pull_wet_api <- function(target_site, start_datetime, end_datetime = Sys.time(),
   urls_dt[, indv_url := paste0("https://wetmapgc.wetec.us/cgi-bin/datadisp_q?ID=", site_num, sensor_number, "&NM=", increments_since_now)]
 
   # Data html processing function
-  process_urls_optimized <- function(indv_url, data_type, site_code, parameter_units) {
-    #browser()
-    tryCatch({
+  process_urls_optimized <-
 
-      # Read and parse HTML
-      response <- GET(indv_url)
-      html_content <- content(response, "text", encoding = "UTF-8")
-
-      # Use base R instead of stringr (faster)
-      lines <- strsplit(html_content, "\n", fixed = TRUE)[[1]]
-      data_lines <- lines[grepl("\\d{2}/\\d{2}/\\d{4}", lines)]
-
-      if (data_type == "Stage") {
-        # Parse stage data
-        parsed_dt <- data.table(raw_line = data_lines)
-        parsed_dt[, c("Date", "Time", "value", "col4", "col5") :=
-                    tstrsplit(raw_line, "\\s+", fill = "right", type.convert = FALSE)]
-      } else {
-        # Parse other data types
-        parsed_dt <- data.table(raw_line = data_lines)
-        parsed_dt[, c("Date", "Time", "value", "col4") :=
-                    tstrsplit(raw_line, "\\s+", fill = "right", type.convert = FALSE)]
-
-      }
-
-      # Parse data to desired formats
-      parsed_dt[, `:=`(
-        Date = mdy(Date),
-        Time = hms::as_hms(Time),
-        value = suppressWarnings(as.numeric(value)) # This is for -9999.00 values which do not get read in correctly yet
-      )]
-
-      # Create datetime column using America/Denver time zone
-      parsed_dt[, datetime := as_datetime(paste0(Date, " ", Time), tz = "America/Denver")]
-
-      # Create final columns
-      parsed_dt[, `:=`(
-        DT_round = with_tz(round_date(datetime, unit = "15 minutes"), tz = "UTC"),
-        DT_round_MT = datetime,
-        site = site_code,
-        parameter = data_type,
-        units = parameter_units,
-        value = fifelse(is.nan(value), NA_real_, value)
-      )]
-
-      # Create DT_join after DT_round is created
-      parsed_dt[, DT_join := as.character(DT_round)]
-
-      # Select final columns
-      result_dt <- parsed_dt[, .(DT_round, DT_round_MT, DT_join, site, parameter, value, units)]
-
-      return(result_dt)
-
-    }, error = function(e) {
-      warning("Error processing URL for ", data_type, ": ", e$message)
-      return(NULL)
-    })
-  }
-
-  # # Not sure if this works yet...
-  # is_shiny <- tryCatch({
-  #   shiny::isRunning()
-  # }, error = function(e) FALSE)
-  #
-  # # TODO: Test this in a shiny app, perhaps we add a T/F param to decide which method to use
-  # if (is_shiny) {
-  #   # Running in Shiny - use progress bar and sequential processing
-  #   progress <- shiny::Progress$new(session, min = 0, max = nrow(urls_dt))
-  #   progress$set(message = "Retrieving data...", value = 0)
-  #   on.exit(progress$close())
-  #
-  #   WQ_data_list <- vector("list", nrow(urls_dt))
-  #   for (i in seq_len(nrow(urls_dt))) {
-  #     progress$set(detail = paste("Processing", urls_dt$data_type[i]), value = i)
-  #     WQ_data_list[[i]] <- process_urls_optimized(
-  #       urls_dt$indv_url[i],
-  #       urls_dt$data_type[i],
-  #       urls_dt$site_code[i],
-  #       urls_dt$parameter_units[i]
-  #     )
-  #   }
-  # } else if (requireNamespace("future", quietly = TRUE) && requireNamespace("furrr", quietly = TRUE)) {
-  #   # Not in Shiny - use parallel processing if available
-  #   future::plan(future::multisession, workers = min(4, nrow(urls_dt)))
-  #   WQ_data_list <- furrr::future_pmap(
-  #     list(urls_dt$indv_url, urls_dt$data_type,
-  #          urls_dt$site_code, urls_dt$parameter_units),
-  #     process_urls_optimized,
-  #     .options = furrr::furrr_options(seed = TRUE)
-  #   )
-  #   future::plan(future::sequential)
-  # } else {
+    # # Not sure if this works yet...
+    # is_shiny <- tryCatch({
+    #   shiny::isRunning()
+    # }, error = function(e) FALSE)
+    #
+    # # TODO: Test this in a shiny app, perhaps we add a T/F param to decide which method to use
+    # if (is_shiny) {
+    #   # Running in Shiny - use progress bar and sequential processing
+    #   progress <- shiny::Progress$new(session, min = 0, max = nrow(urls_dt))
+    #   progress$set(message = "Retrieving data...", value = 0)
+    #   on.exit(progress$close())
+    #
+    #   WQ_data_list <- vector("list", nrow(urls_dt))
+    #   for (i in seq_len(nrow(urls_dt))) {
+    #     progress$set(detail = paste("Processing", urls_dt$data_type[i]), value = i)
+    #     WQ_data_list[[i]] <- process_urls_optimized(
+    #       urls_dt$indv_url[i],
+    #       urls_dt$data_type[i],
+    #       urls_dt$site_code[i],
+    #       urls_dt$parameter_units[i]
+    #     )
+    #   }
+    # } else if (requireNamespace("future", quietly = TRUE) && requireNamespace("furrr", quietly = TRUE)) {
+    #   # Not in Shiny - use parallel processing if available
+    #   future::plan(future::multisession, workers = min(4, nrow(urls_dt)))
+    #   WQ_data_list <- furrr::future_pmap(
+    #     list(urls_dt$indv_url, urls_dt$data_type,
+    #          urls_dt$site_code, urls_dt$parameter_units),
+    #     process_urls_optimized,
+    #     .options = furrr::furrr_options(seed = TRUE)
+    #   )
+    #   future::plan(future::sequential)
+    # } else {
     # Sequential processing
-    WQ_data_list <- pmap(
-      list(urls_dt$indv_url, urls_dt$data_type,
-           urls_dt$site_code, urls_dt$parameter_units),
-      process_urls_optimized)
-  #}
+    WQ_data_list <- pmap(list(urls_dt$indv_url, urls_dt$data_type,urls_dt$site_code, urls_dt$parameter_units),
+                         #function to actually pull data based on parameters/urls
+                         function(indv_url, data_type, site_code, parameter_units) {
+                           tryCatch({
+
+                             # Read and parse HTML
+                             response <- GET(indv_url)
+                             html_content <- content(response, "text", encoding = "UTF-8")
+
+                             # Use base R instead of stringr (faster)
+                             lines <- strsplit(html_content, "\n", fixed = TRUE)[[1]]
+                             data_lines <- lines[grepl("\\d{2}/\\d{2}/\\d{4}", lines)]
+
+                             if (data_type == "Stage") {
+                               # Parse stage data
+                               parsed_dt <- data.table(raw_line = data_lines)
+                               parsed_dt[, c("Date", "Time", "value", "col4", "col5") :=
+                                           tstrsplit(raw_line, "\\s+", fill = "right", type.convert = FALSE)]
+                             } else {
+                               # Parse other data types
+                               parsed_dt <- data.table(raw_line = data_lines)
+                               parsed_dt[, c("Date", "Time", "value", "col4") :=
+                                           tstrsplit(raw_line, "\\s+", fill = "right", type.convert = FALSE)]
+
+                             }
+
+                             # Parse data to desired formats
+                             parsed_dt[, `:=`(
+                               Date = mdy(Date),
+                               Time = hms::as_hms(Time),
+                               value = suppressWarnings(as.numeric(value)) # This is for -9999.00 values which do not get read in correctly yet
+                             )]
+
+                             # Create datetime column using America/Denver time zone
+                             parsed_dt[, datetime := as_datetime(paste0(Date, " ", Time), tz = "America/Denver")]
+
+                             # Create final columns
+                             parsed_dt[, `:=`(
+                               DT_round = with_tz(round_date(datetime, unit = "15 minutes"), tz = "UTC"),
+                               DT_round_MT = datetime,
+                               site = site_code,
+                               parameter = data_type,
+                               units = parameter_units,
+                               value = fifelse(is.nan(value), NA_real_, value)
+                             )]
+
+                             # Create DT_join after DT_round is created
+                             parsed_dt[, DT_join := as.character(DT_round)]
+
+                             # Select final columns
+                             result_dt <- parsed_dt[, .(DT_round, DT_round_MT, DT_join, site, parameter, value, units)]
+
+                             return(result_dt)
+
+                           }, error = function(e) {
+                             warning("Error processing URL for ", data_type, ": ", e$message)
+                             return(NULL)
+                           })
+                         })
 
   # Remove NULL results
   WQ_data_list <- WQ_data_list[!sapply(WQ_data_list, is.null)]
