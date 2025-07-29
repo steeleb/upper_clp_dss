@@ -175,7 +175,7 @@ create_rainbow_flow_plot <- function(station_abbrev, station_plot_name, years = 
     mutate(month_day = date,
            date = ymd(paste0("2000-", date)),
            full_date = as.Date(paste0(as.numeric(cur_year), "-", month_day), format = "%Y-%m-%d"),
-           flow = ifelse(flow <= min_val, min_Val, flow)) %>% # Ensure low/negative flows are set to 0.1 for plotting
+           flow = ifelse(flow <= min_val, min_val, flow)) %>% # Ensure low/negative flows are set to min val for plotting
     arrange(full_date, stat)
 
   percentile_ribbons <- stats_data %>%
