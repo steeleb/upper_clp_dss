@@ -64,7 +64,7 @@ ui <- dashboardPage(
                                          deselectAllText = "Deselect All"
                                        )
                            ),
-                           actionButton("load_data", "Load Selected Dataset")
+                           uiOutput("dynamic_load_button")
                     ),
                     column(4,
                            h4("Log Scale Controls:"),

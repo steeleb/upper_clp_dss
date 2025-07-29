@@ -76,3 +76,14 @@ cdwr_upper_clp_sites <- c(   "LAPLODCO", "JOEBELCO", "JWCCHACO", "CLANSECO", "CL
                              "HOROUTCO", "HSCCLPCO", #Lower CLP Diversions (Horsetooth)
                              "LAPTUNCO", "CAPDCPCO" #laramie river basin
 )
+
+
+#Parameter plot bounds
+plot_param_table <- tibble(
+  parameter = c("Temperature", "Turbidity", "pH", "DO",
+                 "Specific Conductivity", "Chl-a Fluorescence", "FDOM Fluorescence", "Depth"),
+  lower = c(5, 0.1, 6.5, 6, 20, 0.1, 0.1, 0.1),
+  upper = c(20, 50, 9, 10, 60, 1, 1, 2)
+)
+
+

@@ -12,6 +12,18 @@ server <- function(input, output, session) {
   )
   loaded_data <- reactiveVal()
 
+
+  output$dynamic_load_button <- renderUI({
+    div(
+      actionBttn("load_data",
+                 "Load Data",
+                 color = "default",
+                 style = "fill",
+                 size = "lg")
+    )
+  })
+
+
   #### Loading API Data ####
   loaded_data <- eventReactive(input$load_data, {
     req(input$date_range, input$sites_select, input$parameters_select)
@@ -321,8 +333,6 @@ server <- function(input, output, session) {
     lapply(seq_along(input$parameters_select), function(i) {
       parameter <- input$parameters_select[i]
       plot_id <- paste0("time_series_plot_", i)
-
-
       output[[plot_id]] <- renderPlotly({
         # Filter data for this specific parameter
         plot_data <-  filtered_data() %>%
@@ -334,8 +344,37 @@ server <- function(input, output, session) {
         log_input_id <- paste0("log_", gsub("[^A-Za-z0-9]", "_", tolower(parameter)))
         use_log <- if (!is.null(input[[log_input_id]])) input[[log_input_id]] else FALSE
 
-        #set consistent colors for cplotting by site
+        # Get parameter bounds from lookup table
+        param_bounds <- plot_param_table %>%
+          filter(parameter == !!parameter)
+
+        # Determine y-axis limits
+        if(nrow(param_bounds) > 0 && nrow(plot_data) > 0) {
+          data_min <- min(plot_data$mean, na.rm = TRUE)
+          data_max <- max(plot_data$mean, na.rm = TRUE)
+
+          # Use parameter bounds as default, but extend if data goes outside
+          y_min <- min(param_bounds$lower, data_min)
+          y_max <- max(param_bounds$upper, data_max)
+
+          # Add small buffer if data exactly matches bounds
+          if(data_min >= param_bounds$lower && data_max <= param_bounds$upper) {
+            y_min <- param_bounds$lower
+            y_max <- param_bounds$upper
+          }
+        } else if(nrow(plot_data) > 0) {
+          # Fallback to data range if no bounds available
+          y_min <- min(plot_data$mean, na.rm = TRUE)
+          y_max <- max(plot_data$mean, na.rm = TRUE)
+        } else {
+          # Default range if no data
+          y_min <- 0
+          y_max <- 1
+        }
+
+        # Set consistent colors for plotting by site
         color_mapping <- setNames(site_table$color, site_table$site_code)
+
         # Create the plotly plot
         p <- plot_ly(plot_data,
                      x = ~DT_round_MT,
@@ -343,17 +382,17 @@ server <- function(input, output, session) {
                      type = "scatter",
                      color = ~site,
                      colors = color_mapping,
-                     mode = "lines+markers",
+                     mode = "lines",
                      name = ~site_name) %>%
           layout(
             xaxis = list(title = "Date"),
             yaxis = list(
               title = if (use_log) paste("Log10(", parameter, ")") else parameter,
-              type = if (use_log) "log" else "linear"
+              type = if (use_log) "log" else "linear",
+              range = if (use_log) c(log10(max(y_min, 0.01)), log10(y_max)) else c(y_min, y_max)
             ),
             hovermode = "closest"
           )
-
         return(p)
       })
     })
