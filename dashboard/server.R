@@ -1,217 +1,9 @@
-#Prototype dashboard
-# Fixed package loading for shinyapps.io deployment
-# Remove the custom package_loader function and install.packages() calls
-
-# Simply load required packages - shinyapps.io will automatically detect and install them
-suppressMessages({
-  #library(furrr)
-  library(fcw.qaqc)
-  # Date/time handling
-  library(zoo)
-  library(padr)
-  # Data cleaning and utilities
-  library(janitor)
-  library(broom)
-  library(here)
-  # Stats/modeling
-  library(stats)
-  library(RcppRoll)
-  library(trend)
-  library(scales)
-  # Spatial packages
-  library(sf)
-  library(leaflet)
-  # Vis
-  library(ggpubr)
-  library(ggthemes)
-  library(scales)
-  library(plotly)
-  library(ggpmisc)
-  # Web scraping/data retrieval
-  library(rvest)
-  library(httr)
-  library(httr2)
-  library(rjson)
-  library(jsonlite)
-  library(dataRetrieval)
-  library(RSelenium)
-  library(cdssr)
-  library(yaml)
-  # Development tools
-  library(devtools)
-  # Shiny
-  library(shiny)
-  library(shinycssloaders)
-  library(shinyTime)
-  library(bslib)
-  library(shinyWidgets)
-  library(shinydashboard)
-  library(htmltools)
-  library(readr)
-  # Core data manipulation
-  library(tidyverse)
-  library(DT)
-  library(purrr)
-  library(data.table)
-  library(arrow)
-})
-
-#### Set up ####
-
-options(shiny.maxRequestSize = 10000 * 1024^2)
-
-#negate %in% call for easier filtering
-`%nin%` = Negate(`%in%`)
-
-#set consistent site colors and names
-site_table <- tibble(site_code = c("sfm", "chd", "pfal", "pbd", "pbr_fc", "pman_fc"),
-                     site_name = c("South Fork CLP", "Chambers Lake Outflow", "CLP @ Poudre Falls", "Canyon Mouth", "CLP @ Indian Meadows", "CLP @ Manners Bridge"),
-                     color = c("#002EA3", "#E70870", "#256BF5", "#1E4D2B", "#56104E", "#FFCA3A"))
-
-#CDWR sites we are interested in
-cdwr_upper_clp_sites <- c(   "LAPLODCO", "JOEBELCO", "JWCCHACO", "CLANSECO", "CLANLICO", "NPRCANCO",
-                             "MUNCANCO","CLANHACO", "NOCALACO", "CLASRKCO", "CLAFTCCO", #Upper CLP Basin
-                          "HOROUTCO", "HSCCLPCO", #Lower CLP Diversions (Horsetooth)
-                          "LAPTUNCO", "CAPDCPCO" #laramie river basin
-                          )
-
-#### Start UI ####
-ui <- dashboardPage(
-  dashboardHeader(title = "Water Quality Monitoring Dashboard"),
-  #### Define Sidebar ####
-  dashboardSidebar(
-    sidebarMenu(
-      menuItem("Live WQ Data", tabName = "sensor_data", icon = icon("chart-line")),
-      #Placeholder for future functions
-      #menuItem("WQ Forecast", tabName = "forecast", icon = icon("bolt"))
-      menuItem("CLP Basin Conditions", tabName = "flow_data", icon = icon("droplet")),
-      menuItem("Site Map", tabName = "map", icon = icon("map"))
-      #Placeholder for future functions
-      #menuItem("Settings", tabName = "settings", icon = icon("cog"))
-    )
-  ),
-  #### Define Body Styling and start tabs ####
-  dashboardBody(
-    tags$head(
-      tags$style(HTML("
-        .content-wrapper, .right-side {
-          background-color: #f4f4f4;
-        }
-      "))
-    ),
-
-    tabItems(
-    #### Sensor Data Tab ####
-      tabItem(tabName = "sensor_data",
-              fluidRow(
-                box(
-                  title = "Data Controls", status = "primary", solidHeader = TRUE, width = 12,
-                  fluidRow(
-                    column(4,
-                           dateRangeInput("date_range",
-                                          label = "Select Date Range:",
-                                          start = Sys.Date() - 7,
-                                          end = Sys.Date(),
-                                          max = Sys.Date()
-                           ),
-                           pickerInput("sites_select",
-                                       label = "Select Sites:",
-                                       choices = c("South Fork CLP", "Chambers Lake Outflow", "CLP @ Poudre Falls", "Canyon Mouth", "CLP @ Indian Meadows", "CLP @ Manners Bridge"),
-                                       selected = c("South Fork CLP", "Chambers Lake Outflow", "CLP @ Poudre Falls", "Canyon Mouth", "CLP @ Indian Meadows", "CLP @ Manners Bridge"),
-                                       multiple = TRUE,
-                                       options = pickerOptions(
-                                         actionsBox = TRUE,
-                                         selectAllText = "Select All",
-                                         deselectAllText = "Deselect All"
-                                       )
-                           )
-                    ),
-                    column(4,
-                           pickerInput("parameters_select",
-                                       label = "Select Parameters:",
-                                       choices = c("Temperature", "Turbidity", "pH", "DO",
-                                                   "Specific Conductivity", "Chl-a Fluorescence", "FDOM Fluorescence", "Depth"),
-                                       selected = c("Temperature", "Turbidity", "pH", "Specific Conductivity"),
-                                       multiple = TRUE,
-                                       options = pickerOptions(
-                                         actionsBox = TRUE,
-                                         selectAllText = "Select All",
-                                         deselectAllText = "Deselect All"
-                                       )
-                           ),
-                           actionButton("load_data", "Load Selected Dataset")
-                    ),
-                    column(4,
-                           h4("Log Scale Controls:"),
-                           br(),
-                           uiOutput("log_controls"),
-                           br(),
-                           downloadButton("download_data", "Download Data",
-                                          class = "btn-success")
-                    )
-                  )
-                )
-              ),
-
-              fluidRow(
-                box(
-                  title = "Time Series Plots", status = "primary", solidHeader = TRUE, width = 12,
-                  uiOutput("dynamic_plots") %>% withSpinner()
-                )
-              ),
-              fluidRow(
-                box(
-                  title = "Modelled Time Series plots", status = "primary", solidHeader = TRUE, width = 12,
-                  #uiOutput("dynamic_plots") %>% withSpinner()
-                )
-              )
-      ),
-    #### WQ Site Map Tab ####
-      tabItem(tabName = "map",
-              fluidRow(
-                box(
-                  title = "Site Locations", status = "primary", solidHeader = TRUE, width = 12,
-                  leafletOutput("site_map", height = "600px") %>% withSpinner()
-                )
-              )
-      ),
-    #### Flow Data Tab ####
-      tabItem(tabName = "flow_data",
-              layout_columns(
-                col_widths = c(7, 5),
-                # 3-day Q plot card
-                card(
-                  card_header("Current flows (7 days) for key CLP sites"),
-                  card_body(
-                    plotlyOutput("three_day_q_plot")
-                  )
-                ),
-                # Conditional SNOTEL card that will only show between October and July
-                uiOutput("snotel_card")
-              ),
-              # Main Map Card
-              card(
-                card_header("Tracking Flow rates through the CLP network"),
-                card_body(
-                  leafletOutput("map", height = 600)
-                ),
-                card_footer(
-                  "Data retrieved from USGS/CDWR using the cdssr package. Colors indicate flow trend in last 24 hours: red (decreasing), green (increasing), grey (no data)."
-                )
-              )
-      )
-  #### End of Tabs ####
-    )
-  )
-)
-#### End of UI ####
-
 #### Server ####
 
 
 server <- function(input, output, session) {
 
-# Reactive values for storing data
+  # Reactive values for storing data
   values <- reactiveValues(
     all_data = NULL,
     site_locations = NULL,
@@ -220,7 +12,7 @@ server <- function(input, output, session) {
   )
   loaded_data <- reactiveVal()
 
-#### Loading API Data ####
+  #### Loading API Data ####
   loaded_data <- eventReactive(input$load_data, {
     req(input$date_range, input$sites_select, input$parameters_select)
 
@@ -231,40 +23,40 @@ server <- function(input, output, session) {
     # Validate inputs
     withProgress(message = "Retrieving CLP WQ Data...", {
 
-    start_DT <- as.POSIXct(paste0(input$date_range[1], " 00:01"), tz = "America/Denver")
-    end_DT <- as.POSIXct(paste0(input$date_range[2], " 23:55"), tz = "America/Denver")
+      start_DT <- as.POSIXct(paste0(input$date_range[1], " 00:01"), tz = "America/Denver")
+      end_DT <- as.POSIXct(paste0(input$date_range[2], " 23:55"), tz = "America/Denver")
 
-  #### WET API Pull ####
-    #check to see if we need to pull WET data
-    if(any(c("sfm", "chd", "pfal") %in% sites_sel)){
-      # Define invalid values to filter out (these are used by WET team for testing or if data is down)
-      invalid_values <- c(-9999, 638.30, -99.99)
-      # Define sites to pull data for
-      wet_sites <- c("sfm", "chd", "pfal")
-      #grab the sites from sites_sel
-      sites <- sites_sel[sites_sel %in% wet_sites]
-      #report out progress pre pull
-      incProgress(0.2, detail = "Connecting to WET API...")
-      #Pull in data
-      wet_data <- map(sites,
-                      ~pull_wet_api(
-                        target_site = .x,
-                        start_datetime = start_DT,
-                        end_datetime = end_DT,
-                        data_type = "all",
-                        time_window = "all"
-                      )) %>%
-        rbindlist() %>%
-        #remove invalid values or NAs
-        filter(value %nin% invalid_values, !is.na(value)) %>%
-        split(f = list(.$site, .$parameter), sep = "-")
+      #### WET API Pull ####
+      #check to see if we need to pull WET data
+      if(any(c("sfm", "chd", "pfal") %in% sites_sel)){
+        # Define invalid values to filter out (these are used by WET team for testing or if data is down)
+        invalid_values <- c(-9999, 638.30, -99.99)
+        # Define sites to pull data for
+        wet_sites <- c("sfm", "chd", "pfal")
+        #grab the sites from sites_sel
+        sites <- sites_sel[sites_sel %in% wet_sites]
+        #report out progress pre pull
+        incProgress(0.2, detail = "Connecting to WET API...")
+        #Pull in data
+        wet_data <- map(sites,
+                        ~pull_wet_api(
+                          target_site = .x,
+                          start_datetime = start_DT,
+                          end_datetime = end_DT,
+                          data_type = "all",
+                          time_window = "all"
+                        )) %>%
+          rbindlist() %>%
+          #remove invalid values or NAs
+          filter(value %nin% invalid_values, !is.na(value)) %>%
+          split(f = list(.$site, .$parameter), sep = "-")
 
-    }else{
-      #return blank list
-      wet_data <- list()
-    }
+      }else{
+        #return blank list
+        wet_data <- list()
+      }
 
-  #### HydroVu API Pull ####
+      #### HydroVu API Pull ####
 
       # check to see if we need to pull from PBD
       if("pbd" %in% sites_sel){
@@ -339,7 +131,7 @@ server <- function(input, output, session) {
         hv_data <- list()
       }
 
-  #### Contrail API Pull ####
+      #### Contrail API Pull ####
 
       #check to see if we need to access contrail
       if(any(c("pbr_fc", "pman_fc") %in% sites_sel)) {
@@ -352,26 +144,26 @@ server <- function(input, output, session) {
 
         trim_sites <- toupper(gsub("_fc", "", sites))
 
-      # Read credentials
-      creds <- read_yaml("creds/contrail_creds.yml") %>%
-        unlist()
-      username <- as.character(creds["username"])
-      password <- as.character(creds["password"])
+        # Read credentials
+        creds <- read_yaml("creds/contrail_creds.yml") %>%
+          unlist()
+        username <- as.character(creds["username"])
+        password <- as.character(creds["password"])
 
-      contrail_api_urls <- read_csv("creds/contrail_device_urls.csv", show_col_types = F)%>%
-        filter(site_code %in% trim_sites)
-      # Define the folder path where the CSV files are stored
-      # Call the downloader function
-      contrail_data <- pull_contrail_api(start_DT, end_DT, username, password, contrail_api_urls) %>%
-        rbindlist() %>%
-        split(f = list(.$site, .$parameter), sep = "-") %>%
-        keep(~nrow(.) > 0)
+        contrail_api_urls <- read_csv("creds/contrail_device_urls.csv", show_col_types = F)%>%
+          filter(site_code %in% trim_sites)
+        # Define the folder path where the CSV files are stored
+        # Call the downloader function
+        contrail_data <- pull_contrail_api(start_DT, end_DT, username, password, contrail_api_urls) %>%
+          rbindlist() %>%
+          split(f = list(.$site, .$parameter), sep = "-") %>%
+          keep(~nrow(.) > 0)
 
       }else{
         contrail_data <- list()
       }
 
-#### Data Aggregation  ####
+      #### Data Aggregation  ####
 
       incProgress(0.9, detail = "Processing data...")
       # combine all data
@@ -381,10 +173,10 @@ server <- function(input, output, session) {
       list_names <- names(all_data_raw)
       keep_indices <- !grepl("stage", list_names, ignore.case = TRUE)
       all_data_raw <- all_data_raw[keep_indices]
-# Failsafe if there is no data
-if(length(all_data_raw) == 0){
-  stop("No data found for the selected sites and date range.")
-}
+      # Failsafe if there is no data
+      if(length(all_data_raw) == 0){
+        stop("No data found for the selected sites and date range.")
+      }
 
       # Tidy all the raw files
       tidy_data <- all_data_raw %>%
@@ -416,10 +208,10 @@ if(length(all_data_raw) == 0){
       summarized_data <- combined_data %>%
         map(~generate_summary_statistics(.))
 
-     return(summarized_data)
+      return(summarized_data)
     })
   })
-#### Filtered data reactive val ####
+  #### Filtered data reactive val ####
   filtered_data <- reactive({
     req(loaded_data(), input$date_range, input$sites_select, input$parameters_select)
 
@@ -440,7 +232,7 @@ if(length(all_data_raw) == 0){
     return(data)
   })
 
-#### Site Map Output ####
+  #### Site Map Output ####
   #### Get site locations from metadata ####
   observeEvent(input$sites_select, {
     sites_sel <- filter(site_table, site_name %in% input$sites_select )%>%
@@ -479,7 +271,7 @@ if(length(all_data_raw) == 0){
       )
   })
 
-#### Time Series Plots ####
+  #### Time Series Plots ####
   #### Log Controls Dynamic UI ####
   output$log_controls <- renderUI({
     data <- filtered_data()
@@ -534,7 +326,7 @@ if(length(all_data_raw) == 0){
       output[[plot_id]] <- renderPlotly({
         # Filter data for this specific parameter
         plot_data <-  filtered_data() %>%
-                      filter(!is.na(mean)) %>%
+          filter(!is.na(mean)) %>%
           filter(parameter == !!parameter)%>%
           left_join(site_table, by = c("site" = "site_code" ))
 
@@ -568,7 +360,7 @@ if(length(all_data_raw) == 0){
   })
 
 
-#### Flow data Page ####
+  #### Flow data Page ####
 
   # get data for site conditions
   flow_sites_data <- reactive({
@@ -1049,15 +841,12 @@ if(length(all_data_raw) == 0){
 
 
     create_rainbow_flow_plot(station_abbrev = input$site_abbrev_selected,
-                                                     station_plot_name = plot_title,
-                                                      years = 30,
-                                                      incl_winter = F)
+                             station_plot_name = plot_title,
+                             years = 30,
+                             incl_winter = F)
 
   })
 
 
 
 }
-
-# Run the application
-shinyApp(ui = ui, server = server)
