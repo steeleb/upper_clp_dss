@@ -24,6 +24,20 @@ ui <- dashboardPage(
         }
       "))
     ),
+    # Adjusting size of progress bar
+  tags$style(HTML("
+  .shiny-notification-content-progress {
+    font-size: 72px !important;
+    padding: 60px !important;
+  }
+  .progress {
+    height: 120px !important;
+  }
+  .progress-bar {
+    font-size: 64px !important;
+    line-height: 120px !important;
+  }
+")),
 
     tabItems(
       #### Sensor Data Tab ####
