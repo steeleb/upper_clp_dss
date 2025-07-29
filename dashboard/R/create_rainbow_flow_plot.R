@@ -61,7 +61,12 @@
 #'                          incl_winter = F,
 #'                          min_val = 10)
 
-create_rainbow_flow_plot <- function(station_abbrev = NULL, station_plot_name = NULL, years = 30, incl_winter = T, min_val = 0.1){
+create_rainbow_flow_plot <- function(station_abbrev, station_plot_name, years = 30, incl_winter = T, min_val = 0.1){
+
+  if(!is.character(station_abbrev) | !is.character(station_plot_name)){
+    stop("station_abbrev and station_plot_name must be character strings.")
+  }
+
 
   #loading packages
   if (!require(cdssr, quietly = TRUE)) {
