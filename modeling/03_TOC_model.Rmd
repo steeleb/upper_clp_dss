@@ -15,7 +15,7 @@ source("src/setup_libraries.R")
 # Data read
 
 ```{r}
-z <- read_csv('data/parsed_data_ROSS_virridy.csv') %>%
+z <- read_csv('data/upper_clp_dss/modeling/parsed_data_ROSS_virridy.csv') %>%
    #select(2:16)%>%
     rename(id = mw_id) %>%
     mutate(id = as.character(id)) %>%
@@ -27,7 +27,7 @@ z <- read_csv('data/parsed_data_ROSS_virridy.csv') %>%
 
 
 z_norm <- z %>%
-    select( -Kjeldahl, -NO3, -TN, -Phosphorus, -DOC, -clean_sensor_datetime, -Turbidity, -Conductivity, -Depth, -Cl) %>%
+    dplyr::select( -Kjeldahl, -NO3, -TN, -Phosphorus, -DOC, -clean_sensor_datetime, -Turbidity, -Conductivity, -Depth, -Cl) %>%
     mutate(across(where(is.numeric),scales::rescale)) %>%
     mutate(TOC = z$TOC)%>%
     na.omit()
@@ -112,8 +112,8 @@ test_xg <-  xgb.DMatrix(data = as.matrix(test[,features]),
                      label = as.matrix(test[,target]))
 ```
 
-
-FROM SAM SILLEN TO HYPER TUNE RS MODEL: https://zenodo.org/records/11582790
+# Hyperparameter Tuning
+Modified from Sam Sillen's script to hyper tune RS Model: https://zenodo.org/records/11582790
 
 ```{r}
 
@@ -193,14 +193,17 @@ head(importance)
 ```{r}
 test$toc_guess <- predict(toc_mod, test_xg)
 
-ggplot(test, aes(x = TOC, y = toc_guess)) + 
-    geom_point()
+ggplot(test, aes(x = TOC, y = toc_guess, color = collector)) + 
+    geom_point()+
+  geom_abline(slope = 1, intercept = 0, linetype = 'dashed') +
+    labs(x = 'Measured TOC', y = 'Predicted TOC') +
+    ROSS_theme
 
 train$toc_guess <- predict(toc_mod, train_xg)
 
-all <- bind_rows(select(train, TOC, toc_guess, sensor_datetime) %>%
+all <- bind_rows(dplyr::select(train, TOC, toc_guess, sensor_datetime) %>%
                      mutate(group = 'Train'),
-                 select(test, TOC, toc_guess, sensor_datetime) %>%
+                 dplyr::select(test, TOC, toc_guess, sensor_datetime) %>%
                      mutate(group = 'Test'))
 
 ```
