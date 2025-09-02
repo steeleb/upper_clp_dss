@@ -49,8 +49,8 @@ ui <- dashboardPage(
                     column(4,
                            dateRangeInput("date_range",
                                           label = "Select Date Range:",
-                                          start = Sys.Date() - 7,
-                                          end = Sys.Date(),
+                                          start = "2025-06-22",
+                                          end = "2025-07-15",
                                           max = Sys.Date()
                            ),
                            pickerInput("sites_select",
@@ -70,7 +70,7 @@ ui <- dashboardPage(
                                        label = "Select Parameters:",
                                        choices = c("Temperature", "Turbidity", "pH", "DO",
                                                    "Specific Conductivity", "Chl-a Fluorescence", "FDOM Fluorescence", "Depth"),
-                                       selected = c("Temperature", "Turbidity", "pH", "Specific Conductivity"),
+                                       selected = c("Temperature", "Turbidity","Specific Conductivity", "Chl-a Fluorescence", "FDOM Fluorescence"),
                                        multiple = TRUE,
                                        options = pickerOptions(
                                          actionsBox = TRUE,
@@ -78,7 +78,9 @@ ui <- dashboardPage(
                                          deselectAllText = "Deselect All"
                                        )
                            ),
-                           uiOutput("dynamic_load_button")
+                           uiOutput("dynamic_load_button"),
+                           switchInput("apply_qaqc_filter", "Apply Data QAQC",
+                                       value = FALSE, inline = TRUE)
                     ),
                     column(4,
                            h4("Log Scale Controls:"),
@@ -94,14 +96,30 @@ ui <- dashboardPage(
 
               fluidRow(
                 box(
-                  title = "Time Series Plots", status = "primary", solidHeader = TRUE, width = 12,
+                  title = "Time Series Plots", status = "primary", solidHeader = TRUE, width = 12,collapsible = TRUE,
                   uiOutput("dynamic_plots") %>% withSpinner()
                 )
               ),
               fluidRow(
                 box(
-                  title = "Modelled Time Series plots", status = "primary", solidHeader = TRUE, width = 12,
-                  #uiOutput("dynamic_plots") %>% withSpinner()
+                  title = "Modelled Time Series Plots", status = "primary", solidHeader = TRUE, width = 12, collapsible = TRUE,
+                  # User controls
+                  fluidRow(
+                    column(4,
+                           selectInput("model_timestep", "Summarizing Time Step",
+                                       choices = c("15 mins", "1 hour", "4 hours", "6 hours", "12 hours", "1 day"),
+                                       selected = "1 hour")),
+                    column(4,
+                           switchInput("apply_smoothing_filter", "Apply Data Smoothing",
+                                       value = FALSE, inline = TRUE))
+                  ),
+                  # Plot output
+                  fluidRow(
+                    column(12,
+                           uiOutput("toc_plots_panel")
+                           #plotlyOutput("toc_flux_plots") %>% withSpinner()
+                           )
+                  )
                 )
               )
       ),
