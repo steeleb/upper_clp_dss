@@ -46,6 +46,33 @@ network_check <- function(df, network = "all", intrasensor_flags_arg = intrasens
                      "elc",
                      "archery",
                      "riverbluffs")
+  }
+
+  if(network == "uclp_dashboard"){
+    # Define site order based on spatial arrangement along river
+    sites_order <-  c("joei",
+                      "cbri",
+                      "chd",
+                      "pfal",
+                      "sfm",
+                      "pbr_fc",
+                      "pman_fc",
+                      "pbd",
+                      "bellvue",
+                      "salyer",
+                      "udall",
+                      "riverbend",
+                      "cottonwood",
+                      "elc",
+                      "archery",
+                      "riverbluffs")
+
+
+    # # Sites without a network (sfm)
+    # if (site_name %in% c("mtncampus","sfm")){
+    #   site_order <- c("mtncampus","sfm", "pbr_fc")
+    # }
+
   } else {
 
     # Define site order based on spatial arrangement along river
@@ -68,6 +95,10 @@ network_check <- function(df, network = "all", intrasensor_flags_arg = intrasens
     # SFM network
     if (site_name %in% c("mtncampus", "sfm")){
       sites_order <- c("mtncampus", "sfm")
+    }
+    # FC sondes
+    if (site_name %in% c("pbr_fc", "pman_fc")){
+      sites_order <- c("pbr_fc", "pman_fc")
     }
 
     # Sites without a network
