@@ -91,8 +91,11 @@ pull_contrail_api <- function(start_DT, end_DT = Sys.time(), username, password,
   # Create session file for persistent cookies
   session_file <- tempfile()
 
+  contrail_login_url <-"https://contrail.fcgov.com/login/?status=300&message=Redirection:%20Multiple%20Choices&continue=ew"
+  continue_key <- gsub(x = str_extract(contrail_login_url, "continue=([^&]+)"), pattern = "continue=", replacement = "")
+
   # Get the login page and extract CSRF token
-  login_page_req <- request("https://contrail.fcgov.com/login/?status=300&message=Redirection:%20Multiple%20Choices&continue=ZA") |>
+  login_page_req <- request(contrail_login_url) |>
     req_cookie_preserve(session_file)
 
   login_page_resp <- req_perform(login_page_req)
@@ -104,14 +107,14 @@ pull_contrail_api <- function(start_DT, end_DT = Sys.time(), username, password,
     html_attr("value")
 
   #  Login with credentials
-  login_req <- request("https://contrail.fcgov.com/login/?status=300&message=Redirection:%20Multiple%20Choices&continue=ZA") |>
+  login_req <- request(contrail_login_url) |>
     req_cookie_preserve(session_file) |>
     req_method("POST") |>
     req_body_form(
       username = username,
       password = password,
       login = "login",
-      continue = "ZA",  # from your earlier form inspection
+      continue = continue_key,  # from end of url
       csrf_token = csrf_token
     )
 
@@ -135,56 +138,66 @@ pull_contrail_api <- function(start_DT, end_DT = Sys.time(), username, password,
   metas <- api_urls %>%
     mutate(encoded_url = paste0("https://contrail.fcgov.com/export/file/?site_id=",site_id, "&site=",site , "&device_id=", device_id, "&mode=&hours=&data_start=",
                                 start_DT_encoded, "&data_end=", end_DT_encoded, "&tz=US%2FMountain&format_datetime=%25Y-%25m-%25d+%25H%3A%25i%3A%25S&mime=txt&delimiter=comma"
-                                ))
-
-  # Download function for individual URLs
-  download_data <- function(encoded_url, parameter, site_code) {
-    tryCatch({
-      #setup request
-      download_req <- request(encoded_url)%>%
-        req_cookie_preserve(session_file)
-      #perform request
-      download_resp <- req_perform(download_req)
-
-      #if URL is parsed correctly (resp_status = 200), grab the data
-      if(resp_status(download_resp) == 200) {
-
-#TODO: implement try catch here in case there are other errors with the request
-
-        # Save the CSV data
-        csv_content <- resp_body_string(download_resp)
-
-        # Parse the CSV content
-        parsed_data <- read_csv(csv_content, show_col_types = FALSE)%>%
-          #convert datetimes, add in sites and paramters
-          mutate(
-               DT_MT = force_tz(Reading, tzone = "America/Denver"), # Force Reading to America/Denver timezone
-               DT = with_tz(DT_MT, tzone = "UTC"), # Force Reading to UTC timezone
-               DT_round = round_date(DT, "15 minutes"), # Round the DT to 15 minute intervals
-               DT_round_MT = with_tz(DT_round, tz = "America/Denver"), # Create a MT version of the Reading date
-               DT_join = as.character(DT_round), # Create a character version of the UTC time
-               parameter = parameter, # Add the parameter
-               site = paste0(tolower(site_code), "_fc")) %>% # note that the site is managed by Fort Collins
-          dplyr::select(DT_round, DT_round_MT, DT_join, parameter, site,
-                  value = Value, units = Unit) #fix names to match other API sources
-
-        return(parsed_data)
-
-      } else {
-        message("Download failed for: ", encoded_url)
-        return(NULL)
-      }
-
-    }, error = function(e) {
-      message("Error downloading from: ", encoded_url, " - ", e$message)
-      return(NULL)
-    })
-  }
+    ))
 
   # Process all URLs
-  results <- pmap(list(metas$encoded_url, metas$parameter, metas$site_code), download_data)%>%
+  results <- pmap(list(metas$encoded_url, metas$parameter, metas$site_code),
+                  # Function to use url, parameter and site code to download/process datasets from Contrail
+                  function(encoded_url, parameter, site_code){
+                    tryCatch({
+                      #setup request
+                      download_req <- request(encoded_url)%>%
+                        req_cookie_preserve(session_file)
+                      #perform request
+                      download_resp <- req_perform(download_req)
+
+                      #if URL is parsed correctly (resp_status = 200), grab the data
+                      if(resp_status(download_resp) == 200) {
+
+                        #TODO: implement try catch here in case there are other errors with the request
+
+                        # Save the CSV data
+                        csv_content <- resp_body_string(download_resp)
+
+                        # Parse the CSV content
+                        parsed_data <- read_csv(csv_content, show_col_types = FALSE)%>%
+                          #convert datetimes, add in sites and paramters
+                          mutate(
+                            DT_MT = force_tz(Reading, tzone = "America/Denver"), # Force Reading to America/Denver timezone
+                            DT = with_tz(DT_MT, tzone = "UTC"), # Force Reading to UTC timezone
+                            DT_round = round_date(DT, "15 minutes"), # Round the DT to 15 minute intervals
+                            DT_round_MT = with_tz(DT_round, tz = "America/Denver"), # Create a MT version of the Reading date
+                            DT_join = as.character(DT_round), # Create a character version of the UTC time
+                            parameter = parameter, # Add the parameter
+                            site = paste0(tolower(site_code), "_fc"), # note that the site is managed by Fort Collins
+                            units = case_when(parameter == "Specific Conductivity" ~ "µS/cm",
+                                              parameter == "Turbidity" ~ "NTU",
+                                              parameter == "DO" ~ "mg/L",
+                                              parameter == "pH" ~ "pH",
+                                              parameter == "Temperature" ~ "°C",
+                                              parameter == "Chl-a Fluorescence" ~ "RFU",
+                                              parameter == "Blue-Green Algae Fluorescence" ~ "RFU",
+                                              parameter == "Depth" ~ "ft",
+                                              TRUE ~ NA_character_
+                                                )) %>%
+                          dplyr::select(DT_round, DT_round_MT, DT_join, parameter, site,
+                                        value = Value, units) #fix names to match other API sources
+
+                        return(parsed_data)
+
+                      } else {
+                        message("Download failed for: ", site_code, " ", parameter)
+                        return(NULL)
+                      }
+
+                    }, error = function(e) {
+                      message("Error downloading from: ", site_code, " ", parameter)
+                      return(NULL)
+                    })
+                  })%>%
     #remove any missing datasets
     compact()
+  # Message of how many site/parameters where successfully accessed from Contrail
   message("Download Successfull for ", length(results), " of ", length(metas$encoded_url), " datasets")
   return(results)
 }
