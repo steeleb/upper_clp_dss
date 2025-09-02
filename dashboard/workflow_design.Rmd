@@ -9,55 +9,40 @@ output: html_document
 #load all packages and themes
 source("src/setup_libraries.R")
 
-  #manually load in fcw_qaqc functions since sourcing the package is not currently working...
-walk(list.files('src/fcw_QAQC_func/', pattern = "*.R", full.names = TRUE, recursive = TRUE), source)
-
-```
-
-# Site Map
-
-To help visualize!
-
-```{r}
-flow_sites <- cdssr::get_telemetry_stations(water_district = 3) %>% # Specify Poudre basin
-  filter(station_por_end > Sys.Date() - days(30)) %>% # only grab active sites
-  filter(grepl("DIS", parameter)) %>%
-  st_as_sf(coords = c("longitude", "latitude"), crs = 4326) %>%
-  mutate(type = ifelse(structure_type == "Stream Gage", "stream_gage", "diversion"))
-
-    icons <- awesomeIconList(
-      stream_gage = makeAwesomeIcon(icon = "arrow-up", markerColor = "blue", library = "fa", squareMarker = F),
-      diversion = makeAwesomeIcon(icon = "arrow-down", markerColor = "gray", library = "fa", squareMarker = T)
-    )
-
-
-# Load the site map data
-site_loc <- read_csv(here("data", "metadata", "sonde_location_metadata.csv"), show_col_types = F) %>%
-  separate(col = "lat_long", into = c("lat", "lon"), sep = ",", convert = TRUE) %>%
-  st_as_sf(coords = c("lon", "lat"), crs = 4326)
-
-pal <- colorFactor(
-  palette = c("red", "blue", "green", "purple", "orange"),
-  domain = site_loc$Project
+# Configure parallel processing
+max_workers <- 4  
+# Maximum number of parallel workers# set up parallel processing
+num_workers <- min(availableCores() - 1, max_workers)
+plan(multisession, workers = num_workers)
+furrr_options(
+  globals = TRUE,
+  packages = c("arrow", "data.table", "httr2", "tidyverse", "lubridate", "zoo",
+               "padr", "stats", "RcppRoll", "yaml", "here", "fcw.qaqc")
 )
 
-# Create a leaflet map to visualize the sites
-leaflet(site_loc) %>%
-  addTiles() %>%
-  addCircleMarkers(
-    radius = 5,
-    color = ~pal(Project),
-    fillOpacity = 0.5,
-    popup = ~paste("Site:", Site, "<br>", 
-                   "Project: ", Project)
-  ) %>%
-  addAwesomeMarkers(
-    data = flow_sites,
-    icon = ~icons[type],
-        group = ~type,
-    popup = ~paste("Flow Site:", station_name, "<br>",
-                   "Structure Type:", structure_type)
-  )
+# suppress scientific notation for consistent formatting
+options(scipen = 999)
+```
+
+# Pull in cached data from some previous GH actions run
+
+
+```{r}
+cached_data
+
+max_date_site 
+```
+
+
+# Setting up dates
+
+TODO: redo so that it is only pulling the data needed from most recent GH pull
+
+```{r}
+
+start_DT <- ymd_hms("2025-05-01 00:00:00", tz = "America/Denver")
+#start_DT <- Sys.time() - days(7) # Set the start date to 7 days ago
+end_DT <- Sys.time() # Set the end date to now
 
 ```
 
@@ -65,39 +50,27 @@ leaflet(site_loc) %>%
 
 A few notes: When present, the column `DT_round` will be in UTC and `DT_round_MT` will be in Mountain Time. The column `value` is the raw value recorded at that time. The column `parameter` is the name of the parameter being measured (e.g., "water_temperature", "turbidity", etc.). The column `site` is the acronym of the site where the data was collected.
 
-# setting up dates
-
-```{r}
-
-start_DT <- ymd_hms("2025-03-01 00:00:00", tz = "America/Denver")
-#start_DT <- Sys.time() - days(7) # Set the start date to 7 days ago
-end_DT <- Sys.time() # Set the end date to now
-
-```
-
-
-## Radio Telemetry
+## Radio Telemetry Data
 
 This comes through the WET API service which creates a web page for each site and sensor. This is pulled in by the function `pull_wet_api()`. In this chunk we are loading in all the data for the three sites (sfm, chd, pfal) for the last week. 
 
 ```{r}
-
-  # these values were used in testing or are invalid values that we want to filter out
-  #TODO: We may not want to filter them at this step but will later on so that I can see when a sensor is down
-  invalid_values <- c(-9999, 638.30, -99.99)
+# these values were used in testing or are invalid values that we want to filter out
+#TODO: We may not want to filter them at this step but will later on so that I can see when a sensor is down
+invalid_values <- c(-9999, 638.30, -99.99)
 
 source("src/pull_wet_api.R")
-
+# Sites livestreaming via this method
 sites <- c("sfm", "chd", "pfal")
 
 wet_data <- map(sites,
-                     ~pull_wet_api(
-                       target_site = .x,
-                       start_datetime = start_DT,
-                       end_datetime = end_DT,
-                       data_type = "all",
-                       time_window = "all"
-                     ))%>%
+                ~pull_wet_api(
+                  target_site = .x,
+                  start_datetime = start_DT,
+                  end_datetime = end_DT,
+                  data_type = "all",
+                  time_window = "all"
+                ))%>%
   rbindlist()%>%
   #remove invalid values or NAs
   filter(value %nin% invalid_values, !is.na(value))%>%
@@ -105,7 +78,7 @@ wet_data <- map(sites,
 
 ```
 
-## HydroVu Livestream
+## HydroVu Livestream Data
 
 All of the lower sites livestream at a 3 hour interval but our Canyon Mouth site (located just above Greeley intake) does send to this service at a 1 hour interval (we can increase this if needed)
 
@@ -149,13 +122,14 @@ sites <- c("pbd")
 
 # When we are getting all the 2025 data across the network for modeling, use these sites
 #sites <- c("pbd", "salyer", "udall", "riverbend", "cottonwood", "springcreek" , "elc", "boxcreek",  "archery", "riverbluffs")
+source(file = "src/api_puller.R")
 
 walk(sites,
      function(site) {
        message("Requesting HV data for: ", site)
        api_puller(
          site = site,
-        network = "all",
+         network = "all",
          start_dt = with_tz(start_DT, tzone = "UTC"), # api puller needs UTC dates
          end_dt = with_tz(end_DT, tzone = "UTC"),
          api_token = hv_token,
@@ -168,11 +142,11 @@ walk(sites,
 # read in data from staging directory
 
 hv_data <- list.files(staging_directory, full.names = TRUE, pattern = ".parquet") %>%
-  future_map_dfr(function(file_path){
+  map_dfr(function(file_path){
     site_df <- read_parquet(file_path, as_data_frame = TRUE)
     return(site_df)
-  }, .progress = TRUE) %>%
-  #doing some clean up 
+  }) %>%
+  #doing some clean up
   select(-id) %>%
   mutate(units = as.character(units)) %>%
   #double check that Vulink data has been removed
@@ -184,27 +158,30 @@ hv_data <- list.files(staging_directory, full.names = TRUE, pattern = ".parquet"
     DT_join = as.character(DT_round), #keeping in UTC but character form
     site = tolower(site)) %>%
   select(-name) %>%
-  distinct(.keep_all = TRUE) %>%
+  distinct(.keep_all = TRUE)%>%
   split(f = list(.$site, .$parameter), sep = "-") %>%
   keep(~nrow(.) > 0)
 
 ```
 
 
-# Contrail Pull
-
-Need to figure out if there is a API for contrail but for now this will work...
+## Contrail Data
+This is where Fort Collins' data livestreams. Since we have sites colocated there, we will define them as fc
+Need to figure out if there is a more formal API for contrail but for now this will work...
 
 ```{r}
 
 source("src/pull_contrail_api.R")
-
-# Read credentials
+# Read/set up credentials
 creds <- yaml::read_yaml(here("data","upper_clp_dss", "creds","contrail_creds.yml")) %>%
   unlist()
 username <- as.character(creds["username"])
 password <- as.character(creds["password"])
 
+#TODO: Put in FC sites
+
+
+# predefined api urls for contrail to speed up datagrab, could be more robust in the future...
 contrail_api_urls <- read_csv(here("data","upper_clp_dss", "creds", "contrail_device_urls.csv"), show_col_types = F)
 # Define the folder path where the CSV files are stored
 # Call the downloader function
@@ -215,53 +192,65 @@ contrail_data <- pull_contrail_api(start_DT, end_DT, username,password, contrail
 
 ```
 
-# Log Files
+
+
+## Non livestreaming site data: Ignore for now!
+
 
 These data are saved in the `sensor_data` folder and come in both VuLink and Aquatroll logs. All Aquatroll logs are uploaded to HydroVu but Vulink logs cannot be so we will read in both and then join any data not contained in the aquatroll log but that does exist in the VuLink log as a backup. 
 
 
 ```{r}
-
-source("src/parse_insitu_html_log.R")
-#sites that do not livestream
-sites <- c( "cbri","joei", "pbr", "pman") 
-
-troll_files <- list.files(path = "data/sensor_data/2025/", pattern = "troll", full.names = T)%>%
-  #only look for our upper sites that do not livestream in any capacity
-  str_subset(paste(sites, collapse = "|"))
-
-troll_data <- map(troll_files, parse_insitu_html_log) %>%
-  bind_rows()
-
-vulink_files <- list.files(path = "data/sensor_data/2025/", pattern = "vulink", full.names = T)%>%
-  #only look for our upper sites that do not livestream in any capacity
-  str_subset(paste(sites, collapse = "|"))
-
-vulink_data <- map(vulink_files, parse_insitu_html_log) %>%
-  bind_rows()
-
-#always start with troll data and then fill in where needed with vulink data
-log_data <- troll_data %>%
-  #find the data that is not in the troll data but is in the vulink log and bind in
-  bind_rows(anti_join(vulink_data, ., by = c("site", "parameter", "DT_join")))%>%
-  #check for duplicates
-   distinct(.keep_all = TRUE) %>%
-# #format to match other data
-  split(f = list(.$site, .$parameter), sep = "-") %>%
-   keep(~nrow(.) > 0)
+# 
+# source("src/parse_insitu_html_log.R")
+# #sites that do not livestream
+# sites <- c( "cbri","joei", "pbr", "pman", "pfal") 
+# 
+# troll_files <- list.files(path = "data/sensor_data/2025/", pattern = "troll", full.names = T)%>%
+#   #only look for our upper sites that do not livestream in any capacity
+#   str_subset(paste(sites, collapse = "|"))
+# 
+# troll_data <- map(troll_files, parse_insitu_html_log) %>%
+#   bind_rows()
+# 
+# vulink_files <- list.files(path = "data/sensor_data/2025/", pattern = "vulink", full.names = T)%>%
+#   #only look for our upper sites that do not livestream in any capacity
+#   str_subset(paste(sites, collapse = "|"))
+# 
+# vulink_data <- map(vulink_files, parse_insitu_html_log) %>%
+#   bind_rows()
+# 
+# #always start with troll data and then fill in where needed with vulink data
+# log_data <- troll_data %>%
+#   #find the data that is not in the troll data but is in the vulink log and bind in
+#   bind_rows(anti_join(vulink_data, ., by = c("site", "parameter", "DT_join")))%>%
+#   #check for duplicates
+#    distinct(.keep_all = TRUE) %>%
+# # #format to match other data
+#   split(f = list(.$site, .$parameter), sep = "-") %>%
+#    keep(~nrow(.) > 0)
 
 
 ```
 
 
-# To Do next...
-
-Most of this is pulled from 2024 hydrovu api pull 
+# Summarizing/joining Datasets
 
 ```{r}
-# combine all data 
-
-all_data_raw <- c(hv_data, wet_data, contrail_data, log_data )
+# combine all data and remove duplicate site/sensor combos (from log data + livestream)
+all_data_raw <- c(hv_data, wet_data, contrail_data)%>%
+                  #, log_data )%>%
+  bind_rows()%>%
+  #convert depth to m for standardization with seasonal thresholds
+  mutate(value = ifelse(parameter == "Depth" & units == "ft", value * 0.3048, value),
+         units = case_when(parameter == "Depth" & units == "ft" ~ "m", 
+                           parameter == "Temperature" & units == "C" ~ "°C",
+                           TRUE ~ units), 
+         timestamp = DT)%>%
+  #TODO: remove this for backup?
+  filter(between(DT_round, with_tz(start_DT, tzone = "UTC"), with_tz(end_DT, tzone = "UTC")))%>%
+  split(f = list(.$site, .$parameter), sep = "-") %>%
+  keep(~nrow(.) > 0)
 
 # remove stage data 
 list_names <- names(all_data_raw)
@@ -273,23 +262,72 @@ tidy_data <- all_data_raw %>%
   map(~tidy_api_data(api_data = .)) %>%  # the summarize interval default is 15 minutes
   keep(~!is.null(.))
 
-#add field notes
+```
+
+
+## Saving tidy testing dataset
+
+Can probably skip for GH actions version unless we want to commit multiple files
+
+```{r}
+write_rds(tidy_data, paste0("dashboard/data/tidy_data_subset_",as.Date(start_DT),"_",as.Date(end_DT),".rds"))
+
+```
+
+
+
+# Applying QAQC Code
+
+## Reading in summarized dataset
+
+```{r}
+# Read in summarized data for dashboard
+tidy_data <- read_rds(file = "dashboard/data/tidy_data_subset_2025-05-01_2025-08-29.rds")
+
+#remove ORP data
+tidy_data <- tidy_data %>%
+  keep_at(imap_lgl(., ~ !grepl("ORP", .y)))
+```
+
+
+## Read in thresholds and sensor notes
+
+These threshold files will likely need to be uploaded to GH for actions to work or will need to be in the secrets in GH
+
+```{r}
+# Configure your threshold files
+sensor_thresholds_file <- "data/field_notes/qaqc/sensor_spec_thresholds.yml"
+seasonal_thresholds_file <- "data/field_notes/qaqc/updated_seasonal_thresholds_2025_sjs.csv"
+fc_seasonal_thresholds_file <- "data/field_notes/qaqc/fc_seasonal_thresholds_2025_sjs.csv"
+fc_field_notes_file <- "data/sensor_data/FC_sondes/fc_field_notes_formatted.rds"
+# read threshold data
+sensor_thresholds <- read_yaml(sensor_thresholds_file)
+fc_seasonal_thresholds <- read_csv(fc_seasonal_thresholds_file, show_col_types = FALSE)
+#load all thresholds and bind with FC thresholds
+season_thresholds <- read_csv(seasonal_thresholds_file, show_col_types = FALSE)%>%
+  bind_rows(fc_seasonal_thresholds)
+
 # Pulling in the data from mWater (where we record our field notes)
 mWater_creds <- read_yaml(here("creds", "mWaterCreds.yml"))
 mWater_data <- load_mWater(creds = mWater_creds)
-all_field_notes <- grab_mWater_sensor_notes(mWater_api_data = mWater_data)%>%
-  #notes come in as MST, converting to UTC
-  mutate(DT_round = with_tz(DT_round, tzone = "UTC"),
-         last_site_visit = with_tz(last_site_visit, tzone = "UTC"),
-         DT_join = as.character(DT_round))
 
+#Summarized from provided notes in `data/sensor_data/FC_sondes/`
+fc_field_notes <- read_rds(fc_field_notes_file)
+#Joining field notes
+all_field_notes <- grab_mWater_sensor_notes(mWater_api_data = mWater_data) %>%
+  bind_rows(fc_field_notes)
+
+# Grab sensor malfunction notes from mWater (We don't have records of malfunctions from FC so we will use ours as a placeholder)
 sensor_malfunction_notes <- grab_mWater_malfunction_notes(mWater_api_data = mWater_data)%>% 
   #notes come in as MST, converting to UTC
   mutate(start_DT = with_tz(start_DT, tzone = "UTC"),
          end_DT = with_tz(end_DT, tzone = "UTC"))
+```
 
+## Adding field notes and summary statistics
+
+```{r}
 # Add the field note data to all of the data
-#TODO: check in with FC about their field note taking so we can try to add that in later on
 
 combined_data <- tidy_data %>%
   future_map(~add_field_notes(df = ., notes = all_field_notes), .progress = TRUE)
@@ -298,304 +336,231 @@ combined_data <- tidy_data %>%
 summarized_data <- combined_data %>%
   map(~generate_summary_statistics(.))
 
-# # add QAQC things...
+#rm(combined_data, tidy_data)
 ```
 
+## Single Sensor Flags
 
-## Applying QAQC Code
-
-Juan is updating the QAQC Code right now (in particular the season thresholds dataset) so we can hold off on this for now. 
-We will also need to create some seasonal thresholds for the FC sites (PBR_fc and PMAN_fc) and integrate them here too
 
 ```{r}
-# # Read in the threshold data first
-# # sensor_thresholds <- read_yaml(here("data","manual_data_verification","2024_cycle", "hydro_vu_pull", "thresholds", "sensor_spec_thresholds.yml"))
-#season_thresholds <- read_csv(here("data","manual_data_verification","2024_cycle", "hydro_vu_pull", "thresholds", "outdated_seasonal_thresholds.csv"), show_col_types = FALSE)
+# process data in chunks for memory efficiency
+summarized_data_chunks <- split(1:length(summarized_data),
+                                ceiling(seq_along(1:length(summarized_data))/10))
 
-# 
-# # Chunk the data for furrr
-# summarized_data_chunks <- split(1:length(summarized_data),
-#                                 ceiling(seq_along(1:length(summarized_data))/10))
-# # Flag data...
-# # Single parameter flags
-# single_sensor_flags <- list()
-# for (chunk_idx in seq_along(summarized_data_chunks)) {
-#   message("\n=== Processing chunk ", chunk_idx, " of ", length(summarized_data_chunks), " ===")
-# 
-#   # Get the indices for this chunk
-#   indices <- summarized_data_chunks[[chunk_idx]]
-#   chunk_data <- summarized_data[indices]
-# 
-#   # Process the chunk in parallel
-#   chunk_results <- chunk_data %>%
-#     future_map(
-#       function(data) {
-#         flagged_data <- data %>%
-#           data.table(.) %>%
-#           # flag field visits
-#           add_field_flag(df = .) %>%
-#           # flag missing data
-#           add_na_flag(df = .) %>%
-#           # flag DO noise
-#           find_do_noise(df = .) %>%
-#           # flag repeating values
-#           add_repeat_flag(df = .) %>%
-#           # find times when sonde was moved up/down in housing
-#           add_depth_shift_flag(df = ., level_shift_table =  all_field_notes, post2024 = TRUE) %>%
-#           # find instances of sensor drift (FDOM, Chl-a, Turbidity only)
-#           add_drift_flag(df = .)
-# 
-#         if (unique(data$parameter) %in% names(sensor_thresholds)) {
-#           # flag instances outside the spec range
-#           flagged_data <- flagged_data %>%
-#             data.table(.) %>%
-#             add_spec_flag(df = ., spec_table = sensor_thresholds)
-#         }
-# 
-#         if (unique(data$parameter) %in% unique(season_thresholds$parameter)) {
-#           # flag instances outside the spec range
-#           flagged_data <- flagged_data %>%
-#             data.table(.) %>%
-#             add_seasonal_flag(df = ., threshold_table = season_thresholds)
-#         }
-# 
-#         flagged_data <- flagged_data %>%
-#           data.table(.)
-# 
-#         return(flagged_data)
-#       },
-#       .progress = TRUE
-#     )
-# 
-#   # Add chunk to list
-#   single_sensor_flags <- c(single_sensor_flags, chunk_results)
-# 
-#   if (chunk_idx < length(summarized_data_chunks)) {
-#     message("Taking a short break before next chunk...")
-#     gc()
-#     Sys.sleep(0.1)
-#   }
-# }
-# 
-# # Intrasensor flags
-# intrasensor_flags <- single_sensor_flags %>%
-#   rbindlist(fill = TRUE) %>%
-#   split(by = "site")
-# 
-# # Chunk the data for furrr
-# intrasensor_data_chunks <- split(1:length(intrasensor_flags),
-#                                  ceiling(seq_along(1:length(intrasensor_flags))/3))
-# 
-# intrasensor_flags_list <- list()
-# for (chunk_idx in seq_along(intrasensor_data_chunks)) {
-#   message("\n=== Processing chunk ", chunk_idx, " of ", length(intrasensor_data_chunks), " ===")
-# 
-#   # Get the indices for this chunk
-#   indices <- intrasensor_data_chunks[[chunk_idx]]
-#   chunk_data <- intrasensor_flags[indices]
-#   # Process the chunk in parallel
-#   chunk_results <- chunk_data %>%
-#     map(
-#       function(data) {
-#         # A chunk is a site df
-#         flagged_data <- data %>%
-#           data.table() %>%
-#           # flag times when water was below freezing
-#           add_frozen_flag(.) %>%
-#           # overflagging correction. remove slope violation flag if it occurs concurrently
-#           # with temp or depth
-#           intersensor_check(.) %>%
-#           # add sonde burial. If DO is noise is long-term, likely burial:
-#           add_burial_flag(.) %>%
-#           # flag times when sonde was unsubmerged
-#           add_unsubmerged_flag(.)
-# 
-#         return(flagged_data)
-#       }, .progress = TRUE
-#     ) %>%
-#     rbindlist(fill = TRUE) %>%
-#     # lil' cleanup of flag column contents
-#     dplyr::mutate(flag = ifelse(flag == "", NA, flag)) %>%
-#     # transform back to site-parameter dfs
-#     split(f = list(.$site, .$parameter), sep = "-") %>%
-#     purrr::discard(~ nrow(.) == 0) %>%
-#     # Add in KNOWN instances of sensor malfunction
-#     map(~add_malfunction_flag(df = ., malfunction_records = sensor_malfunction_notes))
-# 
-#   # Add chunk to list
-#   intrasensor_flags_list <- c(intrasensor_flags_list, chunk_results)
-# 
-#   if (chunk_idx < length(intrasensor_data_chunks)) {
-#     message("Taking a short break before next chunk...")
-#     gc()
-#     Sys.sleep(0.1)
-#   }
-# }
-# 
-# # Because we are pulling in all of the data for all of the sites, and the
-# # network check to do that is not applicable, here we make a custom net work check function
-# #TODO: Fix this for our livestreaming network
-# #custom_network_check <- function(df, intrasensor_flags_arg = intrasensor_flags_list) {
-# 
-#   site_name <- unique(na.omit(df$site))
-#   parameter_name <- unique(na.omit(df$parameter))
-# 
-#   sites_order <-  c("chd",
-#                     "pfal",
-#                     "sfm",
-#                     "pbd")
-#   
-# #TODO: Decide what to do with other sites that are not livestreaming
-#   # missing sites: mtncampus
-#   if (site_name %in% c("mtncampus", "joei","cbri","pman", "pbr")){
-#     return(df)
-#   }
-# 
-#   # Find the index of current site in ordered list
-#   site_index <- which(sites_order == sites_order[grep(site_name, sites_order, ignore.case = TRUE)])
-# 
-#   # Create site-parameter identifier
-#   site_param <- paste0(site_name, "-", parameter_name)
-# 
-#   # Initialize empty dataframes for upstream/downstream sites
-#   upstr_site_df <- tibble(DT_round = NA)
-#   dnstr_site_df <- tibble(DT_round = NA)
-# 
-#   # Try to get upstream site data
-#   tryCatch({
-#     # Skip trying to find upstream sites for first sites
-#     if (site_index != 1){
-#       previous_site <- paste0(sites_order[site_index-1], "-", parameter_name)
-#       upstr_site_df <- intrasensor_flags_arg[[previous_site]] %>%
-#         select(DT_round, site_up = site, flag_up = flag) %>%
-#         data.table()
-#     }
-#   },
-#   error = function(err) {
-#     message(paste0("No UPSTREAM data found for ", site_param, ". Expected at site '", previous_site, "'."))
-#   })
-# 
-#   # Try to get downstream site data
-#   tryCatch({
-#     # Skip trying to find downstream sites for first sites
-#     if (site_index != length(sites_order)){
-#       next_site <- paste0(sites_order[site_index+1], "-", parameter_name)
-#       dnstr_site_df <- intrasensor_flags_arg[[next_site]] %>%
-#         select(DT_round, site_down = site, flag_down = flag) %>%
-#         data.table()
-#     }
-#   },
-#   error = function(err) {
-#     message(paste0("No DOWNSTREAM data found for ", site_param, ". Expected at site '", next_site, "'."))
-#   })
-# 
-#   # Join current site data with upstream and downstream data
-#   up_down_join <- df %>%
-#     left_join(upstr_site_df, by = "DT_round") %>%
-#     left_join(dnstr_site_df, by = "DT_round")
-# 
-#   # Helper functions
-#   # Function to add column if it doesn't exist
-#   add_column_if_not_exists <- function(df, column_name, default_value = NA) {
-#     if (!column_name %in% colnames(df)) {
-#       df <- df %>% dplyr::mutate(!!sym(column_name) := default_value)
-#     }
-#     return(df)
-#   }
-# 
-#   # Function to check if any flags exist in a time window
-#   check_2_hour_window_fail <- function(x) {
-#     sum(x) >= 1
-#   }
-# 
-#   # Establish helper objects
-#   # String object that is used to ignore flags that we do not want to remove.
-#   ignore_flags <- "drift|DO interference|repeat|sonde not employed|frozen|
-#   unsubmerged|missing data|site visit|sv window|sensor malfunction|burial|
-#   sensor biofouling|improper level cal|sonde moved"
-# 
-#   # Numeric object that determines the width for the rolling window check (2 hours)
-#   width_fun = 17
-# 
-#   # Process flags based on upstream/downstream patterns
-#   final_df <- up_down_join %>%
-#     # Add placeholder columns if joinging didn't provide them
-#     add_column_if_not_exists("flag_down") %>%
-#     add_column_if_not_exists("flag_up") %>%
-#     add_column_if_not_exists("site_down") %>%
-#     add_column_if_not_exists("site_up") %>%
-#     # Create binary indicator for upstream/downstream flags
-#     ## 0 = no relevant flags upstream/downstream
-#     ## 1 = at least one site has relevant flags
-#     dplyr::mutate(flag_binary = dplyr::if_else(
-#       (is.na(flag_up) | grepl(ignore_flags, flag_up)) &
-#         (is.na(flag_down) | grepl(ignore_flags, flag_down)), 0, 1
-#     )) %>%
-#     # Check for flags in 4-hour window (+/-2 hours around each point, 17 observations at 15-min intervals)
-#     dplyr::mutate(overlapping_flag = zoo::rollapply(flag_binary, width = width_fun, FUN = check_2_hour_window_fail, fill = NA, align = "center")) %>%
-#     add_column_if_not_exists(column_name = "auto_flag") %>%
-#     # If flag exists but is also present up/downstream, it likely represents a real event
-#     # In that case, remove the flag (set auto_flag to NA)
-#     dplyr::mutate(auto_flag = ifelse(!is.na(flag) & !grepl(ignore_flags, flag) &
-#                                        (overlapping_flag == TRUE & !is.na(overlapping_flag)), NA, flag)) %>%
-#     dplyr::select(-c(flag_up, flag_down, site_up, site_down, flag_binary, overlapping_flag))
-# 
-#   return(final_df)
-# }
-# 
-# # I really don't understand how network check would work in parallel, so I don't.
-# final_flags <- intrasensor_flags_list %>%
-# #skipping for now
-#   #purrr::map(~custom_network_check(df = ., intrasensor_flags_arg = intrasensor_flags_list)) %>%
-#   rbindlist(fill = TRUE) %>%
-#   tidy_flag_column() %>%
-#   split(f = list(.$site, .$parameter), sep = "-") %>%
-#   purrr::map(~add_suspect_flag(.)) %>%
-#   rbindlist(fill = TRUE)
-# 
-# v_final_flags <- final_flags%>%
-#   dplyr::mutate(auto_flag = ifelse(is.na(auto_flag), NA,
-#                                    ifelse(auto_flag == "suspect data" & is.na(lag(auto_flag, 1)) & is.na(lead(auto_flag, 1)), NA, auto_flag))) %>%
-#   dplyr::select(c("DT_round", "DT_join", "site", "parameter", "mean", "units", "n_obs", "spread", "auto_flag", "mal_flag", "sonde_moved","sonde_employed", "season", "last_site_visit")) %>%
-#   dplyr::mutate(auto_flag = ifelse(is.na(auto_flag), NA, ifelse(auto_flag == "", NA, auto_flag))) %>%
-#   split(f = list(.$site, .$parameter), sep = "-") %>%
-#   keep(~nrow(.) > 0)
-# 
-# # Save the data individually to flagged folder
-# iwalk(v_final_flags, ~write_csv(.x, here("data","api_pull","2024_cycle", "flagged", paste0(.y, ".csv"))))
-# 
-# # store efficiently
-# 
-# # save data
+single_sensor_flags <- list()
+
+for (chunk_idx in seq_along(summarized_data_chunks)) {
+  message("\n=== Processing chunk ", chunk_idx, " of ", length(summarized_data_chunks), " ===")
+  
+  indices <- summarized_data_chunks[[chunk_idx]]
+  chunk_data <- summarized_data[indices]
+  
+  # apply single-parameter flags
+  chunk_results <- chunk_data %>%
+    map(
+      function(data) {
+        flagged_data <- data %>%
+          data.table(.) %>%
+          # flag field visits
+          add_field_flag(df = .) %>%
+          # flag missing/NA values
+          add_na_flag(df = .) %>%
+          # flag dissolved oxygen noise patterns
+          find_do_noise(df = .) %>%
+          # # flag repeating/stuck values
+          # add_repeat_flag(df = .) %>%
+          # # flag depth shifts (sonde movement)
+          # add_depth_shift_flag(df = ., level_shift_table = all_field_notes, post2024 = TRUE) %>%
+          # flag sensor drift (FDOM, Chl-a, Turbidity)
+          add_drift_flag(df = .)
+        
+        # apply sensor specification flags if thresholds exist
+        if (unique(data$parameter) %in% names(sensor_thresholds)) {
+          flagged_data <- flagged_data %>%
+            data.table(.) %>%
+            add_spec_flag(df = ., spec_table = sensor_thresholds)
+        }
+        
+        # apply seasonal threshold flags if available
+        if (unique(data$parameter) %in% unique(season_thresholds$parameter)) {
+          flagged_data <- flagged_data %>%
+            data.table(.) %>%
+            add_seasonal_flag(df = ., threshold_table = season_thresholds)
+        }
+        
+        return(flagged_data)
+      },
+      .progress = TRUE
+    )
+  
+  single_sensor_flags <- c(single_sensor_flags, chunk_results)
+  
+  if (chunk_idx < length(summarized_data_chunks)) {
+    gc()  # garbage collection between chunks
+    Sys.sleep(0.1)
+  }
+}
+```
+
+## Intrasensor flags
+
+```{r}
+# combine single-parameter flags by site
+intrasensor_flags <- single_sensor_flags %>%
+  rbindlist(fill = TRUE) %>%
+  split(by = "site")
+
+# process inter-parameter flags in chunks
+intrasensor_data_chunks <- split(1:length(intrasensor_flags),
+                                 ceiling(seq_along(1:length(intrasensor_flags))/2))
+
+intrasensor_flags_list <- list()
+for (chunk_idx in seq_along(intrasensor_data_chunks)) {
+  message("\n=== Processing chunk ", chunk_idx, " of ", length(intrasensor_data_chunks), " ===")
+  
+  indices <- intrasensor_data_chunks[[chunk_idx]]
+  chunk_data <- intrasensor_flags[indices]
+  
+  chunk_results <- chunk_data %>%
+    map(
+      function(data) {
+        flagged_data <- data %>%
+          data.table() %>%
+          # flag when water temperature below freezing
+          add_frozen_flag(.) %>%
+          # check for overlapping flags and resolve
+          intersensor_check(.) %>%
+          # flag potential sensor burial
+          add_burial_flag(.) %>%
+          # flag when sonde is above water surface
+          add_unsubmerged_flag(.)
+        
+        return(flagged_data)
+      }
+    ) %>%
+    rbindlist(fill = TRUE) %>%
+    mutate(flag = ifelse(flag == "", NA, flag)) %>%
+    split(f = list(.$site, .$parameter), sep = "-") %>%
+     purrr::discard(~ nrow(.) == 0)%>%
+    # # add known sensor malfunction periods
+     map(~add_malfunction_flag(df = ., malfunction_records = sensor_malfunction_notes))
+  
+  intrasensor_flags_list <- c(intrasensor_flags_list, chunk_results)
+  
+  if (chunk_idx < length(intrasensor_data_chunks)) {
+    gc()
+    Sys.sleep(0.1)
+  }
+}
+```
+
+## Network Check and Final Flags
+
+```{r}
+#custom network check while fcw.qaqc package is being updated
+source("src/network_check.R")
+
+# apply network-level quality control
+network_flags <- intrasensor_flags_list %>%
+  # network check compares patterns across sites
+  purrr::map(~network_check(df = .,network = "uclp_dashboard", intrasensor_flags_arg = intrasensor_flags_list)) %>%
+  rbindlist(fill = TRUE) %>%
+  # clean up flag column formatting
+  tidy_flag_column() %>%
+  split(f = list(.$site, .$parameter), sep = "-") %>%
+  # add suspect data flags for isolated anomalies
+  purrr::map(~add_suspect_flag(.)) %>%
+  rbindlist(fill = TRUE)
+
+
+# final data cleaning and preparation
+v_final_flags <- network_flags %>%
+  # Remove isolated suspect flags (single point anomalies)
+  dplyr::mutate(auto_flag = ifelse(
+    is.na(auto_flag), NA,
+    ifelse(auto_flag == "suspect data" &
+             is.na(lag(auto_flag, 1)) &
+             is.na(lead(auto_flag, 1)), NA, auto_flag)
+  )) %>%
+  # select final columns
+  dplyr::select(c("DT_round", "DT_join", "site", "parameter", "mean", "units",
+                  "n_obs", "spread", "auto_flag", "mal_flag", "sonde_moved",
+                  "sonde_employed", "season", "last_site_visit")) %>%
+  # clean up empty flags
+  dplyr::mutate(auto_flag = ifelse(is.na(auto_flag), NA,
+                                   ifelse(auto_flag == "", NA, auto_flag))) %>%
+  # split back into site-parameter combinations
+  split(f = list(.$site, .$parameter), sep = "-") %>%
+  keep(~nrow(.) > 0)
 
 
 ```
+
+```{r}
+ggplotly(v_final_flags%>%
+    filter(parameter == "Temperature"& site %in% c( "pman_fc"))%>%
+    ggplot(aes(DT_round, mean, color = auto_flag))+
+    geom_point()+
+      #scale_color_viridis_c()+
+  #geom_hline(yintercept = 7.2, linetype = "dashed", color = "blue")+
+   # geom_hline(yintercept = 8.8, linetype = "dashed", color = "blue")+
+    facet_wrap(~site))#+
+    #ylim(6,9))
+```
+
 
 # Write to new file
 
 ```{r}
-# bind all the data in tidy_data
 
-all_data_raw <- combined_data %>%
-  bind_rows()%>%
-  # DT round is in UTC, converting to Mountain Time for plotting
-  mutate(DT_round_MT = with_tz(DT_round, tzone = "America/Denver"))%>%
-  #filter(between(DT_round_MT, start_DT, end_DT))%>%
-  #rounding to make plotting easier
-  mutate(mean = signif(mean, 3))
+# save as RDS file
+write_rds(v_final_flags, here("dashboard", "data", "all_sensor_subset_flagged_2025-06-22_2025-08-08.rds"))
+# Commit to repo/cache for later use
 
-min_date <- as_date(min(all_data_raw$DT_round_MT, na.rm = TRUE))
-max_date <- as_date(max(all_data_raw$DT_round_MT, na.rm = TRUE))
-
-write_parquet(all_data_raw, here("data", "upper_clp_dss", "sensor", paste0("uclp_sensor_raw_", min_date, "_", max_date,".parquet")))
 ```
+# End of GH actions run
 
 
 
+# Sam Scratch
 
-# Run below to run entire script
 ```{r}
 
+plot_data <- v_final_flags%>%
+  keep_at(imap_lgl(., ~ grepl("DO", .y))) %>%
+  rbindlist()%>%
+  mutate(DT_round = as.POSIXct(DT_round, tz = "America/Denver"))%>%
+  filter(is.na(mal_flag))#%>%
+  #remove flags that are only outside of seasonal range
+  mutate(auto_flag = case_when(auto_flag == "outside of seasonal range" ~ NA,
+                               auto_flag == "drift" ~ NA,
+                               auto_flag == "drift;missing data" ~ NA,
+                               TRUE ~ auto_flag))
+
+
+ggplotly(ggplot(plot_data%>%filter(site %in% c( "pfal", "pbd") & parameter == "DO"), aes(x = DT_round, y = mean, color = auto_flag)) +
+  geom_point() +
+  facet_wrap(~site)+ #scales = "free_y") +
+  #scale_y_log10()+
+  labs(title = "Flagged Data",
+       x = "Date",
+       y = "Mean") +
+  theme_minimal() +
+  theme(legend.position = "bottom"))
 ```
+
+
+# Create acceptable flags to show on dashboard
+
+```{r}
+
+flag_matrix <- tibble(
+  parameter = c("Temperature", "pH", "Dissolved Oxygen", "Chl-a Fluorescence", "Turbidity", "FDOM Fluorescence", "Specific Conductivity"), 
+  overflagging = c(NA,NA, NA, NA, NA, "outside of seasonal range|drift|drift;missing data", "outside of seasonal range" )
+)
+
+
+```
+
 
 
