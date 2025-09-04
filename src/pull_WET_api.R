@@ -79,8 +79,8 @@ pull_wet_api <- function(target_site, start_datetime, end_datetime = Sys.time(),
   sensor_numbers <- data.table(
     data_type = c("Stage", "Depth", "pH", "Turbidity", "Specific Conductivity",
                   "FDOM Fluorescence", "DO", "Chl-a Fluorescence", "Temperature"),
-    parameter_units = c("ft", "ft", "pH", "NTU", "uS/cm",
-                        "RFU", "mg/L", "RFU", "C"),
+    parameter_units = c("ft", "ft", "pH", "NTU", "µS/cm",
+                        "RFU", "mg/L", "RFU", "°C"),
     sensor_number = c("07", "11", "12", "13", "15",
                       "16", "17", "19", "20"),
     stringsAsFactors = FALSE

@@ -20,6 +20,7 @@ suppressMessages({
   library(RcppRoll)
   library(trend)
   library(scales)
+  library(xgboost)
   # Spatial packages
   library(sf)
   library(leaflet)
@@ -77,13 +78,18 @@ cdwr_upper_clp_sites <- c(   "LAPLODCO", "JOEBELCO", "JWCCHACO", "CLANSECO", "CL
                              "LAPTUNCO", "CAPDCPCO" #laramie river basin
 )
 
+water_chem <- read_parquet("metadata/ROSS_FC_water_chemistry.parquet")
 
 #Parameter plot bounds
 plot_param_table <- tibble(
   parameter = c("Temperature", "Turbidity", "pH", "DO",
-                 "Specific Conductivity", "Chl-a Fluorescence", "FDOM Fluorescence", "Depth"),
-  lower = c(10, 0.1, 6.5, 6, 20, 0.1, 0.1, 0.1),
-  upper = c(20, 50, 9, 10, 60, 1, 1, 2)
+                 "Specific Conductivity", "Chl-a Fluorescence", "FDOM Fluorescence", "Depth",
+                "TOC"),
+  lower = c(10, 0.1, 6.5, 6, 20, 0.1, 0.1, 0.1, 2),
+  upper = c(20, 40, 9, 10, 60, 1, 1, 2, 5)
 )
+toc_model_bounds <- read_parquet("metadata/ROSS_FC_water_chemistry.parquet")%>%
+  summarise(TOC_lower  = min(TOC, na.rm = T),
+            TOC_upper = max(TOC, na.rm = T))
 
 

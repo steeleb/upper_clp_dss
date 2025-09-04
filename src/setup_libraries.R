@@ -18,12 +18,6 @@ package_loader <- function(x) {
 
 invisible(
   lapply(c(
-    # Core data manipulation
-    "tidyverse",
-    "data.table",
-    "arrow",
-    "furrr",
-    "fcw.qaqc",
     # Date/time handling
     "zoo",
     "padr",
@@ -39,8 +33,6 @@ invisible(
     "scales",
     # Spatial packages
     "sf",
-    "terra",
-    "raster",
     "nhdplusTools",
     "tigris",
     "leaflet",
@@ -69,7 +61,14 @@ invisible(
     "cdssr",
     "yaml",
     # Development tools
-    "devtools"
+    "devtools",
+    # Core data manipulation
+    "tidyverse",
+    "data.table",
+    "arrow",
+    "readxl",
+    "furrr",
+    "fcw.qaqc"
   ),
   package_loader)
 )
