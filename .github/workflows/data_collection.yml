@@ -1,0 +1,78 @@
+name: Hourly Data Collection From APIs (HV, WET, Contrail)
+on:
+  schedule:
+    - cron: "0 * * * *"  # Every hour at minute 0
+    # - cron: "0 */2 * * *"  # Every 2 hours (alternative)
+  workflow_dispatch:  # Allows manual triggering for testing
+
+jobs:
+  data-pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      # === SETUP PHASE ===
+      - name: Setup - Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup - Install R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          use-public-rspm: true
+      
+      - name: Setup - Install R packages
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          cache-version: 2
+          packages: |
+            any::tidyverse
+            any::httr
+            any::httr2
+            any::rvest
+            any::tidyr
+            any::here
+            any::purrr
+            any::arrow
+            any::data.table
+            any::lubridate
+            any::yaml
+            any::zoo
+            any::padr
+      
+      # === DATA COLLECTION PHASE ===
+      - name: Collect - WET API data (SFM, CHD, PFAL)
+        run: Rscript src/collect_wet_data.R
+      
+      - name: Collect - HydroVu API data (PBD)
+        env:
+          HYDROVU_CLIENT_ID: ${{ secrets.HYDROVU_CLIENT_ID }}
+          HYDROVU_CLIENT_SECRET: ${{ secrets.HYDROVU_CLIENT_SECRET }}
+        run: Rscript src/collect_hydrovu_data.R
+      
+      - name: Collect - Contrail API data (PBR_FC, PMAN_FC)
+        env:
+          CONTRAIL_USERNAME: ${{ secrets.CONTRAIL_USERNAME }}
+          CONTRAIL_PASSWORD: ${{ secrets.CONTRAIL_PASSWORD }}
+        run: Rscript src/collect_contrail_data.R
+      
+      # === DATA PROCESSING PHASE ===
+      - name: Process - Collate and clean all data
+        run: Rscript src/process_all_data.R
+      
+      # === SAVE PHASE ===
+      - name: Save - Commit and push results
+        run: |
+          git config --global user.email 'actions@github.com'
+          git config --global user.name 'GitHub Actions'
+          git add data_backup/upper_CLP_WQ_data_2025.parquet
+          git add data/temp/
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Hourly data update: $(date -u +%Y-%m-%d_%H:%M:%S_UTC)"
+            git push origin
+            echo "Data successfully updated and pushed"
+          fi
+      
+      # === CLEANUP PHASE ===
+      - name: Cleanup - Remove temporary files
+        if: always()
+        run: Rscript src/cleanup_temp_files.R
