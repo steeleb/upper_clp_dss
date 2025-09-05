@@ -36,27 +36,18 @@ jobs:
             any::yaml
             any::zoo
             any::padr
-      
-      # === DATA COLLECTION PHASE ===
-      - name: Collect - WET API data (SFM, CHD, PFAL)
-        run: Rscript src/collect_wet_data.R
-      
-      - name: Collect - HydroVu API data (PBD)
+            any::Rcpp
+            any::RcppRoll
+            github::ROSSyndicate/fcw.qaqc
+
+      # === DATA COLLATION PHASE ===
+      - name: Collate Data
         env:
           HYDROVU_CLIENT_ID: ${{ secrets.HYDROVU_CLIENT_ID }}
           HYDROVU_CLIENT_SECRET: ${{ secrets.HYDROVU_CLIENT_SECRET }}
-        run: Rscript src/collect_hydrovu_data.R
-      
-      - name: Collect - Contrail API data (PBR_FC, PMAN_FC)
-        env:
-          CONTRAIL_USERNAME: ${{ secrets.CONTRAIL_USERNAME }}
-          CONTRAIL_PASSWORD: ${{ secrets.CONTRAIL_PASSWORD }}
-        run: Rscript src/collect_contrail_data.R
-      
-      # === DATA PROCESSING PHASE ===
-      - name: Process - Collate and clean all data
-        run: Rscript src/process_all_data.R
-      
+          MWATER_SECRET: ${{secrets.MWATER_SECRET}}
+        run: Rscript src/data_collation_workflow.R
+     
       # === SAVE PHASE ===
       - name: Save - Commit and push results
         run: |
