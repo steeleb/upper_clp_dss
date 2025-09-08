@@ -12,12 +12,8 @@ source("src/setup_libraries.R")
 options(scipen = 999)
 
 # Load in saved data ----
-
-cached_data <- read_rds(here("dashboard", "data", "hv_data_20250401_20250904.rds"))
-
-# TODO: Make this a parquet file
-# TODO: Name data something without DTs to make loading easier
-# cached_data <- arrow::read_parquet(here(""))
+cached_data <- arrow::read_parquet(here("dashboard", "data", "data_backup.parquet"),
+                                   as_data_frame = TRUE)
 
 # Get the min max DT from all sites ----
 mm_DT_hv <- cached_data %>%
@@ -40,6 +36,7 @@ mm_DT <- mm_DT_hv
 # Set up dates ----
 start_DT <- mm_DT
 end_DT <- Sys.time() # Set the end date to now
+# TODO: Convert DTs to "America/Denver" for wet/contrail APIs
 
 # Pull in data ----
 
@@ -139,8 +136,6 @@ all_data_raw <- c(hv_data)
                            parameter == "Temperature" & units == "C" ~ "°C",
                            TRUE ~ units),
          timestamp = DT)%>%
-  #TODO: remove this for backup?
-  filter(between(DT_round, with_tz(start_DT, tzone = "UTC"), with_tz(end_DT, tzone = "UTC")))%>%
   split(f = list(.$site, .$parameter), sep = "-") %>%
   keep(~nrow(.) > 0)
 
@@ -157,10 +152,10 @@ tidy_data <- all_data_raw %>%
 
 # Read in threshold and sensor notes ----
 # Configure your threshold files
-sensor_thresholds_file <- "data/field_notes/qaqc/sensor_spec_thresholds.yml"
-seasonal_thresholds_file <- "data/field_notes/qaqc/updated_seasonal_thresholds_2025_sjs.csv"
-fc_seasonal_thresholds_file <- "data/field_notes/qaqc/fc_seasonal_thresholds_2025_sjs.csv"
-fc_field_notes_file <- "data/sensor_data/FC_sondes/fc_field_notes_formatted.rds"
+sensor_thresholds_file <- "dashboard/metadata/sensor_spec_thresholds.yml"
+seasonal_thresholds_file <- "dashboard/metadata/updated_seasonal_thresholds_2025_sjs.csv"
+fc_seasonal_thresholds_file <- "dashboard/metadata/fc_seasonal_thresholds_2025_sjs.csv"
+fc_field_notes_file <- "dashboard/metadata/fc_field_notes_formatted.rds"
 # read threshold data
 sensor_thresholds <- read_yaml(sensor_thresholds_file)
 fc_seasonal_thresholds <- read_csv(fc_seasonal_thresholds_file, show_col_types = FALSE)
@@ -341,8 +336,10 @@ v_final_flags <- network_flags %>%
                                    ifelse(auto_flag == "", NA, auto_flag))) %>%
   # split back into site-parameter combinations
   split(f = list(.$site, .$parameter), sep = "-") %>%
-  keep(~nrow(.) > 0)
+  keep(~nrow(.) > 0) %>%
+  # parquets can't handle the R list metadata, so bind them back into a df
+  bind_rows()
 
 # Write to new file ----
 # Save as parquet file
-arrow::write_parquet(v_final_flags, here("dashboard", "data", "all_sensor_subset_flagged_2025-06-22_2025-08-08.parquet"))
+arrow::write_parquet(v_final_flags, here("dashboard", "data", "data_backup.parquet"))
