@@ -31,7 +31,6 @@ jobs:
             any::janitor
             any::broom
             any::here
-            any::stats
             any::RcppRoll
             any::trend
             any::xgboost
