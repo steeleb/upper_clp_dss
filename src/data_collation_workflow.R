@@ -5,21 +5,19 @@
 # will be sourced by `the shiny app` for plotting the data and pulling the data.
 
 # Set up environment ----
-
-source("src/setup_libraries.R")
+message(paste("Collation Step:", "set up libraries"))
+source("src/data_collation_setup_libraries.R")
 
 # suppress scientific notation to ensure consistent formatting
 options(scipen = 999)
 
 # Load in saved data ----
-
-cached_data <- read_rds(here("dashboard", "data", "hv_data_20250401_20250904.rds"))
-
-# TODO: Make this a parquet file
-# TODO: Name data something without DTs to make loading easier
-# cached_data <- arrow::read_parquet(here(""))
+message(paste("Collation Step:", "loading in cached data"))
+cached_data <- arrow::read_parquet(here("dashboard", "data", "data_backup.parquet"),
+                                   as_data_frame = TRUE)
 
 # Get the min max DT from all sites ----
+message(paste("Collation Step:", "getting start dates"))
 mm_DT_hv <- cached_data %>%
   bind_rows() %>%
   filter(parameter != "ORP") %>%
@@ -40,6 +38,7 @@ mm_DT <- mm_DT_hv
 # Set up dates ----
 start_DT <- mm_DT
 end_DT <- Sys.time() # Set the end date to now
+# TODO: Convert DTs to "America/Denver" for wet/contrail APIs
 
 # Pull in data ----
 
@@ -49,6 +48,7 @@ end_DT <- Sys.time() # Set the end date to now
 ## HydroVu Livestream Data ----
 # Establishing staging directory - Replacing with temp_dir()
 #staging_directory <- here("data", "api_pull", "raw")
+message(paste("Collation Step:", "getting HydroVu livestream data"))
 staging_directory = tempdir()
 
 # Read in credentials
@@ -60,10 +60,22 @@ client_secret <- Sys.getenv("HYDROVU_CLIENT_SECRET")
 # Check if credentials are available
 if(client_id == "" || client_secret == "") {
   stop("HydroVu credentials not found. Please check GitHub Secrets.")
+} else {
+  message(paste("....Collation Step Update:", "HydroVu secrets retrieved"))
 }
 
 # Use credentials
-hv_token <- hv_auth(client_id = client_id, client_secret = client_secret)
+# Wrap the HydroVu auth in a try-catch
+hv_token <- tryCatch({
+  hv_auth(client_id = client_id, client_secret = client_secret)
+}, error = function(e) {
+  message("HydroVu authentication failed: ", e$message)
+  return(NULL)
+})
+
+if(is.null(hv_token)) {
+  stop("Could not authenticate with HydroVu API. Check credentials and API status.")
+}
 
 # Pulling in the data from hydrovu
 # Making the list of sites that we need
@@ -73,6 +85,7 @@ hv_sites <- hv_locations_all(hv_token) %>%
   #these should be included in the historical data pull
   filter(!grepl("2024", name, ignore.case = TRUE))
 
+message(paste("....Collation Step Update:", "successfully pulled in hv_sites object from HydroVu"))
 # these sites are backed up on HydroVu but most do not livestream
 # TODO: set up a daily CRON job that will look to see if any new data is available on HydroVu and grab it when possible?
 # sites <- c( "cbri", "chd","joei",  "pbd", "pbr","pfal", "pman", "sfm")
@@ -84,6 +97,7 @@ sites <- c("pbd")
 #sites <- c("pbd", "salyer", "udall", "riverbend", "cottonwood", "springcreek" , "elc", "boxcreek",  "archery", "riverbluffs")
 source(file = "src/api_puller.R")
 
+message(paste("....Collation Step Update:", "Attempting to pull data from HydroVu API"))
 walk(sites,
      function(site) {
        message("Requesting HV data for: ", site)
@@ -121,6 +135,7 @@ hv_data <- list.files(staging_directory, full.names = TRUE, pattern = ".parquet"
   split(f = list(.$site, .$parameter), sep = "-") %>%
   keep(~nrow(.) > 0)
 
+message(paste("....Collation Step Update:", "successfully pulled and munged HydroVu API data"))
 ## Contrail Data ----
 # TODO: This
 
@@ -130,17 +145,15 @@ hv_data <- list.files(staging_directory, full.names = TRUE, pattern = ".parquet"
 # Clean up data ----
 
 # combine all data and remove duplicate site/sensor combos (from log data + livestream)
-all_data_raw <- c(hv_data)
+all_data_raw <- c(hv_data) %>%
   # c(hv_data, wet_data, contrail_data, log_data) %>%
-  bind_rows()%>%
+  bind_rows() %>%
   #convert depth to m for standardization with seasonal thresholds
   mutate(value = ifelse(parameter == "Depth" & units == "ft", value * 0.3048, value),
          units = case_when(parameter == "Depth" & units == "ft" ~ "m",
                            parameter == "Temperature" & units == "C" ~ "°C",
                            TRUE ~ units),
-         timestamp = DT)%>%
-  #TODO: remove this for backup?
-  filter(between(DT_round, with_tz(start_DT, tzone = "UTC"), with_tz(end_DT, tzone = "UTC")))%>%
+         timestamp = DT) %>%
   split(f = list(.$site, .$parameter), sep = "-") %>%
   keep(~nrow(.) > 0)
 
@@ -153,14 +166,14 @@ all_data_raw <- all_data_raw[keep_indices]
 tidy_data <- all_data_raw %>%
   map(~tidy_api_data(api_data = .)) %>%  # the summarize interval default is 15 minutes
   keep(~!is.null(.)) %>%
-  keep_at(imap_lgl(.m, ~!grepl("ORP", .y)))
+  keep_at(imap_lgl(., ~!grepl("ORP", .y)))
 
 # Read in threshold and sensor notes ----
 # Configure your threshold files
-sensor_thresholds_file <- "data/field_notes/qaqc/sensor_spec_thresholds.yml"
-seasonal_thresholds_file <- "data/field_notes/qaqc/updated_seasonal_thresholds_2025_sjs.csv"
-fc_seasonal_thresholds_file <- "data/field_notes/qaqc/fc_seasonal_thresholds_2025_sjs.csv"
-fc_field_notes_file <- "data/sensor_data/FC_sondes/fc_field_notes_formatted.rds"
+sensor_thresholds_file <- "dashboard/metadata/sensor_spec_thresholds.yml"
+seasonal_thresholds_file <- "dashboard/metadata/updated_seasonal_thresholds_2025_sjs.csv"
+fc_seasonal_thresholds_file <- "dashboard/metadata/fc_seasonal_thresholds_2025_sjs.csv"
+fc_field_notes_file <- "dashboard/metadata/fc_field_notes_formatted.rds"
 # read threshold data
 sensor_thresholds <- read_yaml(sensor_thresholds_file)
 fc_seasonal_thresholds <- read_csv(fc_seasonal_thresholds_file, show_col_types = FALSE)
@@ -170,8 +183,9 @@ season_thresholds <- read_csv(seasonal_thresholds_file, show_col_types = FALSE)%
 
 # Pulling in the data from mWater (where we record our field notes)
 # TODO: Make sure that these secrets work
+message(paste("Collation Step:", "getting mWater creds"))
 mWater_creds <- Sys.getenv("MWATER_SECRET")
-mWater_data <- load_mWater(creds = mWater_creds)
+mWater_data <- fcw.qaqc::load_mWater(creds = mWater_creds)
 
 #Summarized from provided notes in `data/sensor_data/FC_sondes/`
 fc_field_notes <- read_rds(fc_field_notes_file)
@@ -341,8 +355,10 @@ v_final_flags <- network_flags %>%
                                    ifelse(auto_flag == "", NA, auto_flag))) %>%
   # split back into site-parameter combinations
   split(f = list(.$site, .$parameter), sep = "-") %>%
-  keep(~nrow(.) > 0)
+  keep(~nrow(.) > 0) %>%
+  # parquets can't handle the R list metadata, so bind them back into a df
+  bind_rows()
 
 # Write to new file ----
 # Save as parquet file
-arrow::write_parquet(v_final_flags, here("dashboard", "data", "all_sensor_subset_flagged_2025-06-22_2025-08-08.parquet"))
+arrow::write_parquet(v_final_flags, here("dashboard", "data", "data_backup.parquet"))
