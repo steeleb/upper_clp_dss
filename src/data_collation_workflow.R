@@ -6,7 +6,7 @@
 
 # Set up environment ----
 message(paste("Collation Step:", "set up libraries"))
-source("src/setup_libraries.R")
+source("src/data_collation_setup_libraries.R")
 
 # suppress scientific notation to ensure consistent formatting
 options(scipen = 999)

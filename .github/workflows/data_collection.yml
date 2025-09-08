@@ -26,21 +26,32 @@ jobs:
         with:
           cache-version: 2
           packages: |
-            any::tidyverse
-            any::httr
-            any::httr2
-            any::rvest
-            any::tidyr
-            any::here
-            any::purrr
-            any::arrow
-            any::data.table
-            any::lubridate
-            any::yaml
             any::zoo
             any::padr
-            any::Rcpp
+            any::janitor
+            any::broom
+            any::here
+            any::stats
             any::RcppRoll
+            any::trend
+            any::xgboost
+            any::scales
+            any::rvest
+            any::httr
+            any::httr2
+            any::rjson
+            any::jsonlite
+            any::dataRetrieval
+            any::RSelenium
+            any::yaml
+            any::devtools
+            any::tidyverse
+            any::data.table
+            any::arrow
+            any::readxl
+            any::furrr
+            any::Rcpp
+            any::lubridate
             github::ROSSyndicate/fcw.qaqc
       # === DATA COLLATION PHASE ===
       - name: Collate Data
@@ -54,8 +65,7 @@ jobs:
         run: |
           git config --global user.email 'actions@github.com'
           git config --global user.name 'GitHub Actions'
-          git add data_backup/upper_CLP_WQ_data_2025.parquet
-          git add data/temp/
+          git add dashboard/data/data_backup.parquet
           if git diff --staged --quiet; then
             echo "No changes to commit"
           else
@@ -63,7 +73,3 @@ jobs:
             git push origin ${{ github.ref_name }}
             echo "Data successfully updated and pushed"
           fi
-      # === CLEANUP PHASE ===
-      - name: Cleanup - Remove temporary files
-        if: always()
-        run: Rscript src/cleanup_temp_files.R
