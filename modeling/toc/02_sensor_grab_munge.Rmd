@@ -329,7 +329,7 @@ example_site <- "pfal"
 site_title <- "Poudre Falls"
 
 start_dt <- ymd_hm("2024-06-01 00:00", tz = "MST")
-end_dt <- ymd_hm("2024-07-18 00:00", tz = "MST")
+end_dt <- ymd_hm("2024-07-05 00:00", tz = "MST")
 
 example_data <- all_sensor_data_wide%>%
   filter(site == example_site)%>%
