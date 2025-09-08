@@ -148,7 +148,7 @@ all_data_raw <- all_data_raw[keep_indices]
 tidy_data <- all_data_raw %>%
   map(~tidy_api_data(api_data = .)) %>%  # the summarize interval default is 15 minutes
   keep(~!is.null(.)) %>%
-  keep_at(imap_lgl(.m, ~!grepl("ORP", .y)))
+  keep_at(imap_lgl(., ~!grepl("ORP", .y)))
 
 # Read in threshold and sensor notes ----
 # Configure your threshold files
