@@ -58,10 +58,11 @@ invisible(
     "jsonlite",
     "dataRetrieval",
     "RSelenium",
-    "cdssr",
+    # "cdssr",
     "yaml",
     # Development tools
     "devtools",
+    "here",
     # Core data manipulation
     "tidyverse",
     "data.table",
