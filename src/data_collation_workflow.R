@@ -8,13 +8,6 @@
 message(paste("Collation Step:", "set up libraries"))
 source("src/setup_libraries.R")
 
-# Check secrets
-message(paste("Collation Step:", "Checking mWater secrets"))
-mWater_creds <- Sys.getenv("MWATER_SECRET")
-cat("mWater_creds length:", nchar(mWater_creds), "\n")
-cat("mWater_creds class:", class(mWater_creds), "\n")
-mWater_data <- fcw.qaqc::load_mWater(creds = mWater_creds)
-
 # suppress scientific notation to ensure consistent formatting
 options(scipen = 999)
 
@@ -67,10 +60,22 @@ client_secret <- Sys.getenv("HYDROVU_CLIENT_SECRET")
 # Check if credentials are available
 if(client_id == "" || client_secret == "") {
   stop("HydroVu credentials not found. Please check GitHub Secrets.")
+} else {
+  message(paste("....Collation Step Update:", "HydroVu secrets retrieved"))
 }
 
 # Use credentials
-hv_token <- hv_auth(client_id = client_id, client_secret = client_secret)
+# Wrap the HydroVu auth in a try-catch
+hv_token <- tryCatch({
+  hv_auth(client_id = client_id, client_secret = client_secret)
+}, error = function(e) {
+  message("HydroVu authentication failed: ", e$message)
+  return(NULL)
+})
+
+if(is.null(hv_token)) {
+  stop("Could not authenticate with HydroVu API. Check credentials and API status.")
+}
 
 # Pulling in the data from hydrovu
 # Making the list of sites that we need
@@ -80,6 +85,7 @@ hv_sites <- hv_locations_all(hv_token) %>%
   #these should be included in the historical data pull
   filter(!grepl("2024", name, ignore.case = TRUE))
 
+message(paste("....Collation Step Update:", "successfully pulled in hv_sites object from HydroVu"))
 # these sites are backed up on HydroVu but most do not livestream
 # TODO: set up a daily CRON job that will look to see if any new data is available on HydroVu and grab it when possible?
 # sites <- c( "cbri", "chd","joei",  "pbd", "pbr","pfal", "pman", "sfm")
@@ -91,6 +97,7 @@ sites <- c("pbd")
 #sites <- c("pbd", "salyer", "udall", "riverbend", "cottonwood", "springcreek" , "elc", "boxcreek",  "archery", "riverbluffs")
 source(file = "src/api_puller.R")
 
+message(paste("....Collation Step Update:", "Attempting to pull data from HydroVu API"))
 walk(sites,
      function(site) {
        message("Requesting HV data for: ", site)
@@ -128,6 +135,7 @@ hv_data <- list.files(staging_directory, full.names = TRUE, pattern = ".parquet"
   split(f = list(.$site, .$parameter), sep = "-") %>%
   keep(~nrow(.) > 0)
 
+message(paste("....Collation Step Update:", "successfully pulled and munged HydroVu API data"))
 ## Contrail Data ----
 # TODO: This
 
