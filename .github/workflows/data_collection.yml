@@ -3,8 +3,9 @@ on:
   schedule:
     - cron: "0 * * * *"  # Every hour at minute 0
     # - cron: "0 */2 * * *"  # Every 2 hours (alternative)
+  push:
+    branches: [ github-actions-test ]  # Will run when you push to this branch
   workflow_dispatch:  # Allows manual triggering for testing
-
 jobs:
   data-pipeline:
     runs-on: ubuntu-latest
@@ -12,12 +13,10 @@ jobs:
       # === SETUP PHASE ===
       - name: Setup - Checkout code
         uses: actions/checkout@v4
-
       - name: Setup - Install R
         uses: r-lib/actions/setup-r@v2
         with:
           use-public-rspm: true
-
       - name: Setup - Install R packages
         uses: r-lib/actions/setup-r-dependencies@v2
         with:
@@ -39,7 +38,6 @@ jobs:
             any::Rcpp
             any::RcppRoll
             github::ROSSyndicate/fcw.qaqc
-
       # === DATA COLLATION PHASE ===
       - name: Collate Data
         env:
@@ -47,7 +45,6 @@ jobs:
           HYDROVU_CLIENT_SECRET: ${{ secrets.HYDROVU_CLIENT_SECRET }}
           MWATER_SECRET: ${{secrets.MWATER_SECRET}}
         run: Rscript src/data_collation_workflow.R
-
       # === SAVE PHASE ===
       - name: Save - Commit and push results
         run: |
@@ -59,10 +56,9 @@ jobs:
             echo "No changes to commit"
           else
             git commit -m "Hourly data update: $(date -u +%Y-%m-%d_%H:%M:%S_UTC)"
-            git push origin
+            git push origin ${{ github.ref_name }}
             echo "Data successfully updated and pushed"
           fi
-
       # === CLEANUP PHASE ===
       - name: Cleanup - Remove temporary files
         if: always()
