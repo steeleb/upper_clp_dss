@@ -127,15 +127,15 @@ hv_data <- list.files(staging_directory, full.names = TRUE, pattern = ".parquet"
 # Clean up data ----
 
 # combine all data and remove duplicate site/sensor combos (from log data + livestream)
-all_data_raw <- c(hv_data)
+all_data_raw <- c(hv_data) %>%
   # c(hv_data, wet_data, contrail_data, log_data) %>%
-  bind_rows()%>%
+  bind_rows() %>%
   #convert depth to m for standardization with seasonal thresholds
   mutate(value = ifelse(parameter == "Depth" & units == "ft", value * 0.3048, value),
          units = case_when(parameter == "Depth" & units == "ft" ~ "m",
                            parameter == "Temperature" & units == "C" ~ "°C",
                            TRUE ~ units),
-         timestamp = DT)%>%
+         timestamp = DT) %>%
   split(f = list(.$site, .$parameter), sep = "-") %>%
   keep(~nrow(.) > 0)
 
