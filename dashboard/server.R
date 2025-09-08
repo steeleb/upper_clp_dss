@@ -571,8 +571,8 @@ server <- function(input, output, session) {
           data_max <- max(plot_data$mean, na.rm = TRUE)
 
           # Use parameter bounds as default, but extend if data goes outside
-          y_min <- min(param_bounds$lower, data_min)
-          y_max <- max(param_bounds$upper, data_max)
+          y_min <- min(param_bounds$lower, data_min) - 0.2
+          y_max <- max(param_bounds$upper, data_max) + 0.2
 
           # Add small buffer if data exactly matches bounds
           if(data_min >= param_bounds$lower && data_max <= param_bounds$upper) {
