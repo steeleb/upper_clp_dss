@@ -5,17 +5,26 @@
 # will be sourced by `the shiny app` for plotting the data and pulling the data.
 
 # Set up environment ----
-
+message(paste("Collation Step:", "set up libraries"))
 source("src/setup_libraries.R")
+
+# Check secrets
+message(paste("Collation Step:", "Checking mWater secrets"))
+mWater_creds <- Sys.getenv("MWATER_SECRET")
+cat("mWater_creds length:", nchar(mWater_creds), "\n")
+cat("mWater_creds class:", class(mWater_creds), "\n")
+mWater_data <- fcw.qaqc::load_mWater(creds = mWater_creds)
 
 # suppress scientific notation to ensure consistent formatting
 options(scipen = 999)
 
 # Load in saved data ----
+message(paste("Collation Step:", "loading in cached data"))
 cached_data <- arrow::read_parquet(here("dashboard", "data", "data_backup.parquet"),
                                    as_data_frame = TRUE)
 
 # Get the min max DT from all sites ----
+message(paste("Collation Step:", "getting start dates"))
 mm_DT_hv <- cached_data %>%
   bind_rows() %>%
   filter(parameter != "ORP") %>%
@@ -46,6 +55,7 @@ end_DT <- Sys.time() # Set the end date to now
 ## HydroVu Livestream Data ----
 # Establishing staging directory - Replacing with temp_dir()
 #staging_directory <- here("data", "api_pull", "raw")
+message(paste("Collation Step:", "getting HydroVu livestream data"))
 staging_directory = tempdir()
 
 # Read in credentials
@@ -165,8 +175,9 @@ season_thresholds <- read_csv(seasonal_thresholds_file, show_col_types = FALSE)%
 
 # Pulling in the data from mWater (where we record our field notes)
 # TODO: Make sure that these secrets work
+message(paste("Collation Step:", "getting mWater creds"))
 mWater_creds <- Sys.getenv("MWATER_SECRET")
-mWater_data <- load_mWater(creds = mWater_creds)
+mWater_data <- fcw.qaqc::load_mWater(creds = mWater_creds)
 
 #Summarized from provided notes in `data/sensor_data/FC_sondes/`
 fc_field_notes <- read_rds(fc_field_notes_file)
