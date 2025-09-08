@@ -219,7 +219,7 @@ pull_contrail_api <- function(start_DT, end_DT = Sys.time(), username, password,
           download_resp <- req_perform(download_req)
 
           if (resp_status(download_resp) == 200) {
-            message("Downloading for: ", .param, " for site: ", site)
+            #message("Downloading for: ", .param, " for site: ", site)
             # Read CSV content directly from response
             csv_content <- resp_body_string(download_resp)
 
