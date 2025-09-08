@@ -1,6 +1,6 @@
-library(shiny)
+#library(shiny)
 # Run the application
-shinyAppDir("dashboard/")
+shiny::shinyAppDir("dashboard/")
 
 
 
