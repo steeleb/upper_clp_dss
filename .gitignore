@@ -2,8 +2,8 @@
 .Rhistory
 .RData
 .Ruserdata
-data/
+# Only ignore data folder in the project root
+/data/
 creds/
 # mac artifacts
 **.DS_Store
-data

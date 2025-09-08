@@ -1,10 +1,11 @@
-name: Hourly Data Collection From APIs (HV, WET, Contrail)
+name: Hourly Data Collection From APIs (HV, WET, Contrail) test
 on:
   schedule:
     - cron: "0 * * * *"  # Every hour at minute 0
     # - cron: "0 */2 * * *"  # Every 2 hours (alternative)
+  push:
+    branches: [ github-actions-test ]  # Will run when you push to this branch
   workflow_dispatch:  # Allows manual triggering for testing
-
 jobs:
   data-pipeline:
     runs-on: ubuntu-latest
@@ -12,34 +13,45 @@ jobs:
       # === SETUP PHASE ===
       - name: Setup - Checkout code
         uses: actions/checkout@v4
-      
       - name: Setup - Install R
         uses: r-lib/actions/setup-r@v2
         with:
           use-public-rspm: true
-      
+      - name: Setup - Install Ubuntu system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libudunits2-dev libgdal-dev libgeos-dev libproj-dev
       - name: Setup - Install R packages
         uses: r-lib/actions/setup-r-dependencies@v2
         with:
           cache-version: 2
           packages: |
-            any::tidyverse
-            any::httr
-            any::httr2
-            any::rvest
-            any::tidyr
-            any::here
-            any::purrr
-            any::arrow
-            any::data.table
-            any::lubridate
-            any::yaml
             any::zoo
             any::padr
-            any::Rcpp
+            any::janitor
+            any::broom
+            any::here
             any::RcppRoll
+            any::trend
+            any::xgboost
+            any::scales
+            any::rvest
+            any::httr
+            any::httr2
+            any::rjson
+            any::jsonlite
+            any::dataRetrieval
+            any::RSelenium
+            any::yaml
+            any::devtools
+            any::tidyverse
+            any::data.table
+            any::arrow
+            any::readxl
+            any::furrr
+            any::Rcpp
+            any::lubridate
             github::ROSSyndicate/fcw.qaqc
-
       # === DATA COLLATION PHASE ===
       - name: Collate Data
         env:
@@ -47,23 +59,16 @@ jobs:
           HYDROVU_CLIENT_SECRET: ${{ secrets.HYDROVU_CLIENT_SECRET }}
           MWATER_SECRET: ${{secrets.MWATER_SECRET}}
         run: Rscript src/data_collation_workflow.R
-     
       # === SAVE PHASE ===
       - name: Save - Commit and push results
         run: |
           git config --global user.email 'actions@github.com'
           git config --global user.name 'GitHub Actions'
-          git add data_backup/upper_CLP_WQ_data_2025.parquet
-          git add data/temp/
+          git add dashboard/data/data_backup.parquet
           if git diff --staged --quiet; then
             echo "No changes to commit"
           else
             git commit -m "Hourly data update: $(date -u +%Y-%m-%d_%H:%M:%S_UTC)"
-            git push origin
+            git push origin ${{ github.ref_name }}
             echo "Data successfully updated and pushed"
           fi
-      
-      # === CLEANUP PHASE ===
-      - name: Cleanup - Remove temporary files
-        if: always()
-        run: Rscript src/cleanup_temp_files.R
