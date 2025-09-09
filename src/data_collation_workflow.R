@@ -187,8 +187,14 @@ contrail_data <- pull_contrail_api(
   )
 
 # Collating Datasets ----
+# Add previous 26 hours of data to flag properly
+cached_context <- cached_data %>%
+  filter(DT_round >= (utc_start_DT - hours(26))) %>%
+  split(f = list(.$site, .$parameter), sep = "-") %>%
+  keep(~nrow(.) > 0)
+
 # combine all data and remove duplicate site/sensor combos (from log data + livestream)
-all_data_raw <- c(hv_data, wet_data, contrail_data) %>%
+all_data_with_context <- c(hv_data, wet_data, contrail_data, cached_context) %>%
   # c(hv_data, wet_data, contrail_data, log_data) %>%
   bind_rows() %>%
   #convert depth to m for standardization with seasonal thresholds
@@ -201,12 +207,12 @@ all_data_raw <- c(hv_data, wet_data, contrail_data) %>%
   keep(~nrow(.) > 0)
 
 # remove stage data
-list_names <- names(all_data_raw)
+list_names <- names(all_data_with_context)
 keep_indices <- !grepl("stage", list_names, ignore.case = TRUE)
-all_data_raw <- all_data_raw[keep_indices]
+all_data_with_context <- all_data_with_context[keep_indices]
 
 # Tidy all the raw files
-tidy_data <- all_data_raw %>%
+tidy_data <- all_data_with_context %>%
   map(~tidy_api_data(api_data = .)) %>%  # the summarize interval default is 15 minutes
   keep(~!is.null(.)) %>%
   keep_at(imap_lgl(., ~!grepl("ORP", .y)))
@@ -225,7 +231,6 @@ season_thresholds <- read_csv(seasonal_thresholds_file, show_col_types = FALSE)%
   bind_rows(fc_seasonal_thresholds)
 
 # Pulling in the data from mWater (where we record our field notes)
-# TODO: Make sure that these secrets work
 message(paste("Collation Step:", "getting mWater creds"))
 mWater_creds <- Sys.getenv("MWATER_SECRET")
 mWater_data <- fcw.qaqc::load_mWater(creds = mWater_creds)
@@ -402,6 +407,13 @@ v_final_flags <- network_flags %>%
   # parquets can't handle the R list metadata, so bind them back into a df
   bind_rows()
 
+# Remove overlapping time periods from cached data, then add all new data ----
+final_data <- cached_data %>%
+  anti_join(v_final_flags, by = c("site", "parameter", "DT_round")) %>%
+  bind_rows(v_final_flags) %>%
+  arrange(site, parameter, DT_round)
+
+
 # Write to new file ----
 # Save as parquet file
-arrow::write_parquet(v_final_flags, here("dashboard", "data", "data_backup.parquet"))
+arrow::write_parquet(final_data, here("dashboard", "data", "data_backup.parquet"))
