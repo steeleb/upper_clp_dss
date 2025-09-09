@@ -18,7 +18,9 @@ cached_data <- arrow::read_parquet(here("dashboard", "data", "data_backup.parque
 
 # Get the min max DT from all sites ----
 message(paste("Collation Step:", "getting start dates"))
-mm_DT_hv <- cached_data %>%
+# The cached data will have all of the data from all of the
+# sources, so this should not have to change.
+mm_DT <- cached_data %>%
   bind_rows() %>%
   filter(parameter != "ORP") %>%
   group_by(site, parameter) %>%
@@ -28,22 +30,55 @@ mm_DT_hv <- cached_data %>%
   slice(1) %>%
   pull(max_dt)
 
-mm_DT <- mm_DT_hv
-
-# TODO: Set the mm_DT objects up properly
-# mm_DT_wet
-# mm_DT_contrail
-# mm_DT <- min(mm_DT_hv, mm_DT_wet, mm_DT_contrail)
-
 # Set up dates ----
-start_DT <- mm_DT
-end_DT <- Sys.time() # Set the end date to now
-# TODO: Convert DTs to "America/Denver" for wet/contrail APIs
+# Check mm_DT timezone
+mm_DT_tz <- lubridate::tz(mm_DT)
+if (mm_DT_tz == "UTC") {
+
+  # Grab Sys.time()
+  t <- Sys.time()
+
+  # Make the start/end time in UTC
+  utc_start_DT <- lubridate::with_tz(mm_DT, "UTC")
+  utc_end_DT <- lubridate::with_tz(t, "UTC")
+
+  # Make the start/end time in America/Denver
+  denver_start_DT <- lubridate::with_tz(mm_DT, "America/Denver")
+  denver_end_DT <- lubridate::with_tz(t, "America/Denver")
+
+} else if (mm_DT_tz != "UTC") {
+  # Wrong timezone specified
+  stop("wrong timezone available in cached data.")
+} else if (is.null(mm_DT_tz) || mm_DT_tz == "") {
+  # No timezone specified
+  stop("no timezone available in cached data.")
+} else {
+  # Unknown error
+  stop("unknown tz error.")
+}
+
 
 # Pull in data ----
 
-## Radio Telemetry Data
-# TODO: This
+## Radio Telemetry Data ----
+# This comes through the WET API service.
+# Pulled in by the function `pull_wet_api()`.
+invalid_wet_values <- c(-9999, 638.30, -99.99)
+source("src/pull_wet_api.R")
+
+wet_sites <- c("sfm", "chd", "pfal")
+
+wet_data <- map(wet_sites,
+                ~pull_wet_api(
+                  target_site = .x,
+                  start_datetime = denver_start_DT,
+                  end_datetime = denver_end_DT,
+                  data_type = "all",
+                  time_window = "all"
+                ))%>%
+  rbindlist()%>%
+  filter(value %nin% invalid_wet_values, !is.na(value))%>%
+  split(f = list(.$site, .$parameter), sep = "-")
 
 ## HydroVu Livestream Data ----
 # Establishing staging directory - Replacing with temp_dir()
@@ -56,7 +91,6 @@ staging_directory = tempdir()
 # TODO: Set Up GH secrets
 client_id <- Sys.getenv("HYDROVU_CLIENT_ID")
 client_secret <- Sys.getenv("HYDROVU_CLIENT_SECRET")
-
 # Check if credentials are available
 if(client_id == "" || client_secret == "") {
   stop("HydroVu credentials not found. Please check GitHub Secrets.")
@@ -103,8 +137,8 @@ walk(sites,
        message("Requesting HV data for: ", site)
        api_puller(
          site = site,
-         start_dt = with_tz(start_DT, tzone = "UTC"), # api puller needs UTC dates
-         end_dt = with_tz(end_DT, tzone = "UTC"),
+         start_dt = utc_start_DT, # api puller needs UTC dates
+         end_dt = utc_end_DT,
          api_token = hv_token,
          hv_sites_arg = hv_sites,
          dump_dir = staging_directory
@@ -136,16 +170,13 @@ hv_data <- list.files(staging_directory, full.names = TRUE, pattern = ".parquet"
   keep(~nrow(.) > 0)
 
 message(paste("....Collation Step Update:", "successfully pulled and munged HydroVu API data"))
+
 ## Contrail Data ----
 # TODO: This
 
 # Collating Datasets ----
-# TODO: This
-
-# Clean up data ----
-
 # combine all data and remove duplicate site/sensor combos (from log data + livestream)
-all_data_raw <- c(hv_data) %>%
+all_data_raw <- c(hv_data, wet_data) %>%
   # c(hv_data, wet_data, contrail_data, log_data) %>%
   bind_rows() %>%
   #convert depth to m for standardization with seasonal thresholds
