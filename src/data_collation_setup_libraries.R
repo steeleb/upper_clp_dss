@@ -27,6 +27,7 @@ invisible(
     # Stats/modeling
     "RcppRoll",
     # Web scraping/data retrieval
+    "rvest",
     "httr",
     "httr2",
     "yaml",

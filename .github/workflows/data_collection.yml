@@ -32,6 +32,7 @@ jobs:
             any::here
             any::Rcpp
             any::RcppRoll
+            any::rvest
             any::httr
             any::httr2
             any::yaml
