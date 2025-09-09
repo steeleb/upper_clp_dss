@@ -29,7 +29,7 @@ server <- function(input, output, session) {
     withProgress(message = "Retrieving CLP WQ Data...", {
 
       # read inputs once at startup
-      date_range <- isolate(input$date_range)
+      date_range <- isolate(input$date_range) # This is where the user picks the start DT
       sites_select <- isolate(input$sites_select)
       parameters_select <- isolate(input$parameters_select)
 
@@ -38,10 +38,13 @@ server <- function(input, output, session) {
       sites_sel <- filter(site_table, site_name %in% sites_select) %>%
         pull(site_code)
 
-      #TODO: read in cached data from GH
+      # TODO: read in cached data from GH
+      # This is where we would read the cached data from the github link
+      github_link <- "https://github.com/rossyndicate/upper_clp_dss/raw/main/dashboard/data/data_backup.parquet"
+      cached_data <- arrow::read_parquet(github_link, as_data_frame = TRUE)
 
-      #TODO: Start DT should be based on max(cached_data$DT_round_MT)
-      start_DT <- as.POSIXct(paste0(date_range[1], " 00:01"), tz = "America/Denver")
+      start_DT <- with_tz(max(cached_data$DT_round), "America/Denver")
+
       end_DT   <- as.POSIXct(paste0(date_range[2], " 23:55"), tz = "America/Denver")
 
 
@@ -244,18 +247,19 @@ server <- function(input, output, session) {
                end_DT = with_tz(end_DT, tzone = "UTC"))
 
       # Add the field note data to all of the data
+      # This is the most recent uncleaned data that we got from the API
       combined_data <- tidy_data %>%
         map(~add_field_notes(df = ., notes = all_field_notes), .progress = TRUE)%>%
         bind_rows()%>%
         mutate(auto_flag = NA,
                mal_flag = NA)
-#TODO: add in any other columns needed?
 
-#TODO: Bind with cached data (psuedo code below)
-      #dashboard_data <- bind_rows(cached_dataset, combined_data)
+      #TODO: Bind with cached data
+      dashboard_data <- cached_data %>%
+        anti_join(combined_data, by = c("site", "parameter", "DT_round")) %>%
+        bind_rows(combined_data) %>%
+        arrange(site, parameter, DT_round)
 
-      #TODO: Remove when cached data is  correctly bound
-      dashboard_data <- combined_data
       # Set the loaded data
       incProgress(1, detail = "Data Loaded")
 

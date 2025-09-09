@@ -23,33 +23,20 @@ invisible(
     "padr",
     # Data cleaning and utilities
     "janitor",
-    "broom",
     "here",
     # Stats/modeling
-    "stats",
     "RcppRoll",
-    "trend",
-    "xgboost",
-    "scales",
     # Web scraping/data retrieval
     "rvest",
     "httr",
     "httr2",
-    "rjson",
-    "jsonlite",
-    "dataRetrieval",
-    "RSelenium",
-    # "cdssr",
     "yaml",
     # Development tools
-    "devtools",
     "here",
     # Core data manipulation
     "tidyverse",
     "data.table",
     "arrow",
-    "readxl",
-    "furrr",
     "fcw.qaqc"
   ),
   package_loader)

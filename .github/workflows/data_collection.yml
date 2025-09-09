@@ -4,7 +4,7 @@ on:
     - cron: "0 * * * *"  # Every hour at minute 0
     # - cron: "0 */2 * * *"  # Every 2 hours (alternative)
   push:
-    branches: [ github-actions-test ]  # Will run when you push to this branch
+    branches: [ main ]  # Will run when you push to this branch
   workflow_dispatch:  # Allows manual triggering for testing
 jobs:
   data-pipeline:
@@ -24,40 +24,32 @@ jobs:
       - name: Setup - Install R packages
         uses: r-lib/actions/setup-r-dependencies@v2
         with:
-          cache-version: 2
+          cache-version: 1
           packages: |
             any::zoo
             any::padr
             any::janitor
-            any::broom
             any::here
+            any::Rcpp
             any::RcppRoll
-            any::trend
-            any::xgboost
-            any::scales
             any::rvest
             any::httr
             any::httr2
-            any::rjson
-            any::jsonlite
-            any::dataRetrieval
-            any::RSelenium
             any::yaml
-            any::devtools
             any::tidyverse
             any::data.table
             any::arrow
-            any::readxl
-            any::furrr
-            any::Rcpp
-            any::lubridate
             github::ROSSyndicate/fcw.qaqc
       # === DATA COLLATION PHASE ===
       - name: Collate Data
+        working-directory: ./  # Ensure we're in the repo root
         env:
           HYDROVU_CLIENT_ID: ${{ secrets.HYDROVU_CLIENT_ID }}
           HYDROVU_CLIENT_SECRET: ${{ secrets.HYDROVU_CLIENT_SECRET }}
           MWATER_SECRET: ${{secrets.MWATER_SECRET}}
+          CONTRAIL_CLIENT_ID: ${{ secrets.CONTRAIL_CLIENT_ID }}
+          CONTRAIL_CLIENT_SECRET: ${{ secrets.CONTRAIL_CLIENT_SECRET }}
+          CONTRAIL_CLIENT_URL: ${{ secrets.CONTRAIL_CLIENT_URL }}
         run: Rscript src/data_collation_workflow.R
       # === SAVE PHASE ===
       - name: Save - Commit and push results

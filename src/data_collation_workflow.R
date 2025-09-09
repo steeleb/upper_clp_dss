@@ -18,7 +18,9 @@ cached_data <- arrow::read_parquet(here("dashboard", "data", "data_backup.parque
 
 # Get the min max DT from all sites ----
 message(paste("Collation Step:", "getting start dates"))
-mm_DT_hv <- cached_data %>%
+# The cached data will have all of the data from all of the
+# sources, so this should not have to change.
+mm_DT <- cached_data %>%
   bind_rows() %>%
   filter(parameter != "ORP") %>%
   group_by(site, parameter) %>%
@@ -26,24 +28,59 @@ mm_DT_hv <- cached_data %>%
             .groups = "drop") %>%
   filter(max_dt == min(max_dt, na.rm = T)) %>%
   slice(1) %>%
-  pull(max_dt)
-
-mm_DT <- mm_DT_hv
-
-# TODO: Set the mm_DT objects up properly
-# mm_DT_wet
-# mm_DT_contrail
-# mm_DT <- min(mm_DT_hv, mm_DT_wet, mm_DT_contrail)
+  pull(max_dt) %>%
+  # This prevents data pulling errors from HV
+  {if (format(., "%H:%M:%S") == "00:00:00") . + lubridate::seconds(1) else .}
 
 # Set up dates ----
-start_DT <- mm_DT
-end_DT <- Sys.time() # Set the end date to now
-# TODO: Convert DTs to "America/Denver" for wet/contrail APIs
+# Check mm_DT timezone
+mm_DT_tz <- lubridate::tz(mm_DT)
+if (mm_DT_tz == "UTC") {
+
+  # Grab Sys.time()
+  t <- Sys.time()
+
+  # Make the start/end time in UTC
+  utc_start_DT <- lubridate::with_tz(mm_DT, "UTC")
+  utc_end_DT <- lubridate::with_tz(t, "UTC")
+
+  # Make the start/end time in America/Denver
+  denver_start_DT <- lubridate::with_tz(mm_DT, "America/Denver")
+  denver_end_DT <- lubridate::with_tz(t, "America/Denver")
+
+} else if (mm_DT_tz != "UTC") {
+  # Wrong timezone specified
+  stop("wrong timezone available in cached data.")
+} else if (is.null(mm_DT_tz) || mm_DT_tz == "") {
+  # No timezone specified
+  stop("no timezone available in cached data.")
+} else {
+  # Unknown error
+  stop("unknown tz error.")
+}
+
 
 # Pull in data ----
 
-## Radio Telemetry Data
-# TODO: This
+## Radio Telemetry Data ----
+# This comes through the WET API service.
+# Pulled in by the function `pull_wet_api()`.
+invalid_wet_values <- c(-9999, 638.30, -99.99)
+source(file = here("src", "pull_WET_api.R"))
+
+wet_sites <- c("sfm", "chd", "pfal")
+
+wet_data <- map(wet_sites,
+                ~pull_wet_api(
+                  target_site = .x,
+                  start_datetime = denver_start_DT,
+                  end_datetime = denver_end_DT,
+                  data_type = "all",
+                  time_window = "all"
+                ))%>%
+  rbindlist()%>%
+  filter(value %nin% invalid_wet_values, !is.na(value))%>%
+  split(f = list(.$site, .$parameter), sep = "-")
 
 ## HydroVu Livestream Data ----
 # Establishing staging directory - Replacing with temp_dir()
@@ -53,10 +90,8 @@ staging_directory = tempdir()
 
 # Read in credentials
 # Get credentials from environment variables (GitHub Secrets)
-# TODO: Set Up GH secrets
 client_id <- Sys.getenv("HYDROVU_CLIENT_ID")
 client_secret <- Sys.getenv("HYDROVU_CLIENT_SECRET")
-
 # Check if credentials are available
 if(client_id == "" || client_secret == "") {
   stop("HydroVu credentials not found. Please check GitHub Secrets.")
@@ -95,7 +130,7 @@ sites <- c("pbd")
 
 # When we are getting all the 2025 data across the network for modeling, use these sites
 #sites <- c("pbd", "salyer", "udall", "riverbend", "cottonwood", "springcreek" , "elc", "boxcreek",  "archery", "riverbluffs")
-source(file = "src/api_puller.R")
+source(file = here("src", "api_puller.R"))
 
 message(paste("....Collation Step Update:", "Attempting to pull data from HydroVu API"))
 walk(sites,
@@ -103,8 +138,8 @@ walk(sites,
        message("Requesting HV data for: ", site)
        api_puller(
          site = site,
-         start_dt = with_tz(start_DT, tzone = "UTC"), # api puller needs UTC dates
-         end_dt = with_tz(end_DT, tzone = "UTC"),
+         start_dt = utc_start_DT, # api puller needs UTC dates
+         end_dt = utc_end_DT,
          api_token = hv_token,
          hv_sites_arg = hv_sites,
          dump_dir = staging_directory
@@ -136,16 +171,31 @@ hv_data <- list.files(staging_directory, full.names = TRUE, pattern = ".parquet"
   keep(~nrow(.) > 0)
 
 message(paste("....Collation Step Update:", "successfully pulled and munged HydroVu API data"))
+
 ## Contrail Data ----
-# TODO: This
+source(file = here("src", "pull_contrail_api.R"))
+
+contrail_un <- Sys.getenv("CONTRAIL_CLIENT_ID")
+contrail_pw <- Sys.getenv("CONTRAIL_CLIENT_SECRET")
+contrail_url <- Sys.getenv("CONTRAIL_CLIENT_URL")
+
+contrail_data <- pull_contrail_api(
+  start_DT = denver_start_DT,
+  end_DT = denver_end_DT,
+  username = contrail_un,
+  password = contrail_pw,
+  login_url = contrail_url
+  )
 
 # Collating Datasets ----
-# TODO: This
-
-# Clean up data ----
+# Add previous 26 hours of data to flag properly
+cached_context <- cached_data %>%
+  filter(DT_round >= (utc_start_DT - hours(26))) %>%
+  split(f = list(.$site, .$parameter), sep = "-") %>%
+  keep(~nrow(.) > 0)
 
 # combine all data and remove duplicate site/sensor combos (from log data + livestream)
-all_data_raw <- c(hv_data) %>%
+all_data_with_context <- c(hv_data, wet_data, contrail_data, cached_context) %>%
   # c(hv_data, wet_data, contrail_data, log_data) %>%
   bind_rows() %>%
   #convert depth to m for standardization with seasonal thresholds
@@ -158,12 +208,12 @@ all_data_raw <- c(hv_data) %>%
   keep(~nrow(.) > 0)
 
 # remove stage data
-list_names <- names(all_data_raw)
+list_names <- names(all_data_with_context)
 keep_indices <- !grepl("stage", list_names, ignore.case = TRUE)
-all_data_raw <- all_data_raw[keep_indices]
+all_data_with_context <- all_data_with_context[keep_indices]
 
 # Tidy all the raw files
-tidy_data <- all_data_raw %>%
+tidy_data <- all_data_with_context %>%
   map(~tidy_api_data(api_data = .)) %>%  # the summarize interval default is 15 minutes
   keep(~!is.null(.)) %>%
   keep_at(imap_lgl(., ~!grepl("ORP", .y)))
@@ -182,7 +232,6 @@ season_thresholds <- read_csv(seasonal_thresholds_file, show_col_types = FALSE)%
   bind_rows(fc_seasonal_thresholds)
 
 # Pulling in the data from mWater (where we record our field notes)
-# TODO: Make sure that these secrets work
 message(paste("Collation Step:", "getting mWater creds"))
 mWater_creds <- Sys.getenv("MWATER_SECRET")
 mWater_data <- fcw.qaqc::load_mWater(creds = mWater_creds)
@@ -204,7 +253,7 @@ sensor_malfunction_notes <- grab_mWater_malfunction_notes(mWater_api_data = mWat
 # Add the field note data to all of the data
 
 combined_data <- tidy_data %>%
-  future_map(~add_field_notes(df = ., notes = all_field_notes), .progress = TRUE)
+  map(~add_field_notes(df = ., notes = all_field_notes), .progress = TRUE)
 
 # # Add summary statistics
 summarized_data <- combined_data %>%
@@ -359,6 +408,12 @@ v_final_flags <- network_flags %>%
   # parquets can't handle the R list metadata, so bind them back into a df
   bind_rows()
 
+# Remove overlapping time periods from cached data, then add all new data ----
+final_data <- cached_data %>%
+  anti_join(v_final_flags, by = c("site", "parameter", "DT_round")) %>%
+  bind_rows(v_final_flags) %>%
+  arrange(site, parameter, DT_round)
+
 # Write to new file ----
 # Save as parquet file
-arrow::write_parquet(v_final_flags, here("dashboard", "data", "data_backup.parquet"))
+arrow::write_parquet(final_data, here("dashboard", "data", "data_backup.parquet"))
