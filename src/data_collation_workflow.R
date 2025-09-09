@@ -247,7 +247,7 @@ sensor_malfunction_notes <- grab_mWater_malfunction_notes(mWater_api_data = mWat
 # Add the field note data to all of the data
 
 combined_data <- tidy_data %>%
-  future_map(~add_field_notes(df = ., notes = all_field_notes), .progress = TRUE)
+  map(~add_field_notes(df = ., notes = all_field_notes), .progress = TRUE)
 
 # # Add summary statistics
 summarized_data <- combined_data %>%
