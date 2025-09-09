@@ -40,7 +40,7 @@ TODO: redo so that it is only pulling the data needed from most recent GH pull
 
 ```{r}
 
-start_DT <- ymd_hms("2025-05-01 00:00:00", tz = "America/Denver")
+start_DT <- ymd_hms("2025-04-01 00:00:00", tz = "America/Denver")
 #start_DT <- Sys.time() - days(7) # Set the start date to 7 days ago
 end_DT <- Sys.time() # Set the end date to now
 
@@ -177,18 +177,10 @@ creds <- yaml::read_yaml(here("data","upper_clp_dss", "creds","contrail_creds.ym
   unlist()
 username <- as.character(creds["username"])
 password <- as.character(creds["password"])
+login_url <- as.character(creds["login_url"])
 
-#TODO: Put in FC sites
-
-
-# predefined api urls for contrail to speed up datagrab, could be more robust in the future...
-contrail_api_urls <- read_csv(here("data","upper_clp_dss", "creds", "contrail_device_urls.csv"), show_col_types = F)
-# Define the folder path where the CSV files are stored
 # Call the downloader function
-contrail_data <- pull_contrail_api(start_DT, end_DT, username,password, contrail_api_urls)%>%
-  rbindlist()%>%
-  split(f = list(.$site, .$parameter), sep = "-") %>%
-  keep(~nrow(.) > 0)
+contrail_data <- pull_contrail_api(start_DT, end_DT, username,password, login_url)
 
 ```
 
@@ -232,6 +224,19 @@ These data are saved in the `sensor_data` folder and come in both VuLink and Aqu
 
 
 ```
+
+# Pull dataset
+
+```{r}
+
+write_rds(wet_data, "data/upper_clp_dss/api_pull/raw/wet_data_20250401_20250904.rds")
+write_rds(hv_data, "data/upper_clp_dss/api_pull/raw/hv_data_20250401_20250904.rds")
+write_rds(contrail_data, "data/upper_clp_dss/api_pull/raw/contrail_data_20250401_20250904.rds")
+
+
+
+```
+
 
 
 # Summarizing/joining Datasets

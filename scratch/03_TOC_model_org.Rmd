@@ -1,0 +1,1029 @@
+---
+title: "Testing TOC preds"
+author: "Matthew Ross & Sam Struthers-ROSSyndicate"
+date: "2025-08-01"
+output: html_document
+---
+
+# Package load
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+source("src/setup_libraries.R")
+library(purrr)
+library(ggplot2)
+library(dplyr)
+library(gridExtra)
+library(grid)
+library(Ckmeans.1d.dp)
+library(DiagrammeR)
+library(Metrics)
+library(caret)
+library(glue)
+set.seed(123)
+```
+
+## Plotting functions
+
+```{r}
+# Function to create performance plots from model dataframe
+create_performance_plots <- function(model_dataframe) {
+  
+  performance_plots <- map(1:nrow(model_dataframe), function(i) {
+    model <- model_dataframe[i, ]
+    
+    # Create parameter table (excluding evaluation_log and other non-parameter columns)
+    param_cols <- select(model, -c(model_id, evaluation_log, best_iteration, 
+                                  best_score, best_msg, best_iter, train_perf, 
+                                  val_perf, val_train_dist))
+    
+    table_grob <- param_cols %>%
+      t() %>%
+      as.data.frame() %>%
+      tibble::rownames_to_column("Parameter") %>%
+      rename(Value = V1) %>%
+      tableGrob(rows = NULL, theme = ttheme_minimal())
+    
+    # Create the model performance plot
+    model_plot <- ggplot(model[["evaluation_log"]][[1]], aes(x = iter)) +
+      geom_line(aes(y = train_rmse), color = "red", alpha = 0.7) +
+      geom_line(aes(y = val_rmse), color = "blue", alpha = 0.7) +
+      geom_point(x = model$best_iteration, y = model$best_score, 
+                 color = "black", size = 2) +
+      annotate("text", 
+               x = model$best_iteration, 
+               y = model$best_score, 
+               label = paste0("Best Iter: ", model$best_iteration, 
+                             "\nScore: ", round(model$best_score, 3)),
+               vjust = -1, hjust = 0.5, size = 3) +
+      labs(x = "Iteration",
+           y = "Root Mean Square Error",
+           subtitle = paste("Train RMSE:", round(model$train_perf, 3), 
+                           "| Val RMSE:", round(model$val_perf, 3))) +
+      theme_minimal()
+    
+    # Combine plot and table
+    combined_plot <- grid.arrange(
+      model_plot,
+      table_grob,
+      ncol = 2,
+      widths = c(3, 1),  # Plot takes 3/4 width, table takes 1/4
+      top = textGrob(paste("Model ID:", model$model_id), 
+                     gp = gpar(fontsize = 14, fontface = "bold"))
+    )
+    
+    return(combined_plot) 
+  })
+  
+  return(performance_plots)
+}
+
+# Function to display individual plots
+display_individual_plots <- function(performance_plots) {
+  walk(performance_plots, function(p) {
+    grid.newpage()
+    grid.draw(p)
+  })
+}
+
+# Function to create and display combined plot
+create_combined_plot <- function(performance_plots, ncol = 2, title = "XGBoost Model Comparison") {
+  combined_large_plot <- grid.arrange(grobs = performance_plots, 
+                                     ncol = ncol,
+                                     top = textGrob(title, 
+                                                   gp = gpar(fontsize = 16, fontface = "bold")))
+  
+  # Display the large combined plot
+  grid.newpage()
+  grid.draw(combined_large_plot)
+  
+  return(combined_large_plot)
+}
+```
+
+## Train Test Split helper function
+Helps generate potential splits by setting proportional range (.2-.3) and t test for distribution check
+
+```{r}
+setup_train_val_split <- function(sites = unique(train_val$id), prop_range = c(0.2, 0.3), max_attempts = 100) {
+  
+  all_sites <- unique(train_val$id)
+  min_prop <- min(prop_range)
+  max_prop <- max(prop_range)
+  
+  for (attempt in 1:max_attempts) {
+    
+    # Randomly sample sites for training
+    n_train_sites <- sample(3:length(all_sites), 1)  # At least 3 sites for training
+    train_sites <- sample(all_sites, n_train_sites)
+    
+    # Create train and validation sets
+    train_model_1 <- train_val %>%
+      filter(id %in% train_sites)
+    
+    val_model_1 <- train_val %>%
+      filter(!id %in% train_sites)
+    
+    # Skip if either set is empty
+    if (nrow(train_model_1) == 0 || nrow(val_model_1) == 0) {
+      next
+    }
+    
+    # Check validation proportion
+    val_prop <- nrow(val_model_1) / (nrow(train_model_1) + nrow(val_model_1))
+    
+    # Check if proportion is within range
+    if (val_prop < min_prop || val_prop > max_prop) {
+      next
+    }
+    
+    # Perform t-test
+    test_result <- tryCatch({
+      t.test(train_model_1$TOC, val_model_1$TOC, paired = FALSE, var.equal = TRUE, conf.level = 0.95)
+    }, error = function(e) {
+      return(NULL)
+    })
+    
+    if (is.null(test_result)) {
+      next
+    }
+    
+    test_val <- test_result$p.value
+    
+    # Check if conditions are met
+    if (test_val > 0.05) {
+      
+      # Print results
+      cat("Success on attempt", attempt, "\n")
+      cat("Training sites:", paste(train_sites, collapse = ", "), "\n")
+      cat("Validation sites:", paste(setdiff(all_sites, train_sites), collapse = ", "), "\n")
+      cat("Validation proportion:", round(val_prop, 3), "\n")
+      cat("T-test p-value:", round(test_val, 4), "\n")
+      
+      # Create plots
+      hist_plot <- ggplot() +
+        geom_histogram(data = val_model_1, aes(x = TOC, fill = "Validation"), alpha = 0.7) +
+        geom_histogram(data = train_model_1, aes(x = TOC, fill = "Training"), alpha = 0.7) +
+        labs(x = 'TOC', y = 'Count', fill = "Dataset") +
+        theme_minimal()
+      
+      box_plot <- ggplot() +
+        geom_boxplot(data = val_model_1, aes(y = TOC, x = "Validation")) +
+        geom_boxplot(data = train_model_1, aes(y = TOC, x = "Training")) +
+        labs(x = 'Dataset', y = 'TOC') +
+        theme_minimal()
+      
+      print(hist_plot)
+      print(box_plot)
+      
+      # Return results as a list
+      return(list(
+        train_sites = train_sites,
+        val_sites = setdiff(all_sites, train_sites),
+        train_data = train_model_1,
+        val_data = val_model_1,
+        val_prop = val_prop,
+        p_value = test_val,
+        attempts = attempt
+      ))
+    }
+  }
+  
+  # If no valid combination found
+  warning(paste("No valid site combination found after", max_attempts, "attempts"))
+  return(NULL)
+}
+
+```
+
+
+# Create scaling based on all sensor data
+
+```{r}
+# Read in all data to create scaling parameters
+all_sensor_data_wide <- read_parquet("data/upper_clp_dss/sensor/prepped/all_sensor_data_2023-03-30_2025-07-15.parquet")
+
+# Use the complete sensor dataset for scaling parameters (assuming sensor has all necessary columns already)
+complete_sensor_data <- all_sensor_data_wide %>%
+  mutate(month = lubridate::month(DT_round))%>%
+  select(FDOM = `FDOM Fluorescence`,
+         hrs_since_last_cleaning = hours_since_last_visit,
+         Temp = Temperature,
+         Sensor_Cond = `Specific Conductivity`,
+         Sensor_Turb = Turbidity,
+         Chl_a = `Chl-a Fluorescence`, 
+         month)%>%
+
+  mutate(#capping sensor turb at 1000 for outliers
+         Sensor_Turb = ifelse(Sensor_Turb > 1000, 1000,
+                              ifelse(Sensor_Turb <= 0, 0.01, Sensor_Turb)), # if turb is zero, replace with 0.01 to avoid division by zero
+         log_sensor_turb = log(Sensor_Turb), 
+         Chl_a = ifelse(Chl_a == 0,0.0001, Chl_a),# if Chl_A is zero, replace with 0.001 to avoid division by zero
+         log_chl_a = log(Chl_a),
+           #compute optical bands
+         f_c_turb = FDOM/(Chl_a + Sensor_Turb + FDOM))%>%
+  #remove NAs
+  filter(!is.na(hrs_since_last_cleaning) & !is.na(f_c_turb) & !is.na(Temp)& !is.na(Sensor_Cond))
+  
+# Save the original min/max values for each numeric column
+scaling_params <- complete_sensor_data %>%
+  select(where(is.numeric)) %>%
+  summarise(across(everything(), list(min = min, max = max), .names = "{.col}_{.fn}"))
+
+# Save these parameters
+#saveRDS(scaling_params, "data/upper_clp_dss/modeling/scaling_parameters_20250820.rds")
+# Load saved scaling parameters
+#scaling_params <- readRDS("data/upper_clp_dss/modeling/scaling_parameters_20250820.rds")
+
+# Function to apply the same scaling to new data
+apply_training_scale <- function(new_data, scaling_params) {
+  numeric_cols <- names(select(new_data, where(is.numeric)))
+  
+  scaled_data <- new_data
+  
+  for (col in numeric_cols) {
+    min_val <- scaling_params[[paste0(col, "_min")]]
+    max_val <- scaling_params[[paste0(col, "_max")]]
+    
+    # Apply same min-max scaling as training data
+    scaled_data[[col]] <- (new_data[[col]] - min_val) / (max_val - min_val)
+  }
+  
+  return(scaled_data)
+}
+```
+
+
+# Read in Data
+
+```{r}
+# Read in all matches data
+all_matches <- read_csv(file = 'data/upper_clp_dss/modeling/parsed_data_ROSS_virridy.csv', show_col_types = F) %>%
+    mutate(id = as.character(mw_id)) %>%
+   mutate(#capping sensor turb at 1000 for outliers
+         Sensor_Turb = ifelse(Sensor_Turb > 1000, 1000,
+                              ifelse(Sensor_Turb <= 0, 0.001, Sensor_Turb)),
+         log_sensor_turb = log(Sensor_Turb), 
+           #compute optical bands
+         f_c_turb = FDOM/(Chl_a + Sensor_Turb + FDOM), 
+         log_chl_a = log(Chl_a))%>%
+  #remove NAs
+  filter(!is.na(hrs_since_last_cleaning) & !is.na(f_c_turb) & !is.na(Temp)& !is.na(Sensor_Cond))%>%
+  mutate(clean_sensor_datetime = parse_date_time(sensor_datetime, orders = c("%Y-%m-%d %H:%M:%S", "%m/%d/%y %H:%M","%Y-%m-%d" )))%>%
+  mutate(sensor_datetime = force_tz(clean_sensor_datetime, tzone = 'MST'), 
+         month = lubridate::month(sensor_datetime))%>%
+  #remove other parameters other than sensor values (to be normalized)
+    select(  -NO3, -TN, -DOC, -Kjeldahl, -Phosphorus,  -clean_sensor_datetime, -Turbidity, -Conductivity, -Depth, -Cl, -mw_id)
+
+# Apply scaling to dataset
+all_matches_norm <- all_matches %>%
+  #remove TOC
+  select(-TOC)%>%
+  #normalize data based on full sensor set from 01_sensor_data_prep.rmd and the chunk above
+  apply_training_scale(., scaling_params)%>%
+  #add back in TOC (non normalized)
+  mutate(TOC = all_matches$TOC)%>%
+  na.omit()
+
+
+features <- c('FDOM', 'Sensor_Turb',"log_sensor_turb" ,  'Sensor_Cond', 'Chl_a','Temp','f_c_turb', "log_chl_a", "month")#,'f_turb' )
+```
+
+# Set aside testing dataset
+
+```{r}
+all_matches_trimmed <- all_matches_norm%>%
+    filter(!(id == "cbri" & between(sensor_datetime, "2024-10-08", "2024-10-10")))%>% #exclude a cbri sample taken during release
+  filter(!(id == "pman" & between(sensor_datetime, "2025-05-28", "2025-06-01")))%>% #exclude a pman sample with bad sensor data
+filter( id %nin% c("springcreek", "boxcreek"))
+
+
+testing <- all_matches_trimmed %>%
+  filter((year(sensor_datetime) == 2025 & id %in% c("chd", "sfm", "pbr", "pman", "pbd")))
+
+
+train_val <- all_matches_trimmed %>%
+  anti_join(testing)%>%
+  select(id, any_of(features),TOC, sensor_datetime, collector)
+
+```
+
+
+# Overview of all data
+
+```{r}
+# 
+# all_matches <- read_csv(file = 'data/upper_clp_dss/modeling/parsed_data_ROSS_virridy.csv', show_col_types = F) %>%
+#     mutate(id = as.character(mw_id)) %>%
+#    mutate(#capping sensor turb at 1000 for outliers
+#          Sensor_Turb = ifelse(Sensor_Turb > 1000, 1000,
+#                               ifelse(Sensor_Turb <= 0, 0.001, Sensor_Turb)),
+#            #compute optical bands
+#          f_c_turb = FDOM/(Chl_a + Sensor_Turb + FDOM),
+#          f_turb = FDOM/Sensor_Turb,
+#          f_chla = FDOM/Chl_a,
+#          chla_turb = Chl_a/Sensor_Turb)%>%
+#   #remove NAs
+#   filter(!is.na(hrs_since_last_cleaning) & !is.na(f_c_turb) & !is.na(Temp)& !is.na(Sensor_Cond))%>%
+#   mutate(clean_sensor_datetime = parse_date_time(sensor_datetime, orders = c("%Y-%m-%d %H:%M:%S", "%m/%d/%y %H:%M","%Y-%m-%d" )))%>%
+#   mutate(sensor_datetime = force_tz(clean_sensor_datetime, tzone = 'MST'))
+# 
+# GGally::ggpairs(all_matches %>% select(TOC, all_of( features)))
+# 
+# z_norm %>%
+#   filter(collector != "Virridy") %>%
+#   mutate(month = as.character(month(sensor_datetime)),
+#          year = year(sensor_datetime)) %>%
+#   ggplot(aes(x = month, y = TOC)) +
+#   geom_dotplot(binaxis = "y",
+#                stackdir = "center",
+#                position = "dodge",
+#                binwidth = 0.1,
+#                dotsize = 0.8) +
+#   facet_grid(year~id) +
+#   scale_x_discrete(limits = c("4", "5", "6", "7", "8", "9", "10", "11"),
+#                    #only add titles to even numbers
+#                    breaks = c("4","6","8","10")) +
+#   labs(x = "Month",
+#        y = "TOC") +
+#   theme(axis.text.x = element_text(angle = 45, hjust = 1))
+# 
+# 
+# 
+# z_norm %>%
+#   mutate(month = as.character(month(sensor_datetime)),
+#          year = year(sensor_datetime)) %>%
+#   ggplot(aes(x = sensor_datetime, y = TOC, color = id,
+#              shape = collector)) +
+#   geom_point()+
+#   facet_grid(~year, scales = "free") +
+#   #order the x axis from 4-11
+#   #scale_x_discrete(limits = c("4", "5", "6", "7", "8", "9", "10", "11")) +
+#   labs(x = "Date",
+#        y = "TOC",
+#        color = "Site ID",
+#        shape = "collector") +
+#   theme(axis.text.x = element_text(angle = 45, hjust = 1))
+# #give me the counts by site
+# z_norm %>%
+#     group_by(id) %>%
+#     summarize(count = n()) %>%
+#     arrange(desc(count)) %>%
+#     mutate(id = factor(id, levels = id)) %>%
+#     ggplot(aes(x = id, y = count)) +
+#     geom_col() +
+#     coord_flip() +
+#     labs(x = 'Site', y = 'Count') +
+#     ROSS_theme
+# #histogram of TOC by site
+# # z_norm %>%
+# #     ggplot(aes(x = TOC, fill = id)) +
+# #     geom_histogram()+
+# #     labs(x = 'TOC', y = 'Count') +
+# #       facet_wrap(~id)
+# 
+# # #counts by month
+# # z_norm %>%
+# #     mutate(month = month(sensor_datetime),
+# #            year = year(sensor_datetime)) %>%
+# #     group_by(month) %>%
+# #     summarize(count = n()) %>%
+# #     arrange(desc(count)) %>%
+# #     mutate(month = factor(month, levels = month)) %>%
+# #     ggplot(aes(x = month, y = count)) + 
+# #     geom_col() + 
+# #     coord_flip() +
+# #     labs(x = 'Month', y = 'Count') +
+# #     ROSS_theme
+```
+
+
+# Create/Check Data Splits
+
+## Model one
+
+Training sites: udall, pbd, sfm, lbea, archery_virridy, cbri, joei, elc, riverbluffs, archery, riverbend, salyer, 105075514, 105075538, 105075545, 105075552, 105075583, 105075600, 105075624
+
+Validation sites:  penn, pfal, chd,  105075569
+
+```{r}
+set_one_val <- train_val%>%
+  filter(id %in% c( "penn", "chd","pfal", "105075569"))
+set_one_train <- train_val %>%
+  anti_join(set_one_val, by = 'id')
+
+ggplot(set_one_train, aes(x = TOC)) +
+  geom_histogram(aes(fill = 'Train'), alpha = 0.5, position = 'identity') +
+  geom_histogram(data = set_one_val, aes(x = TOC, fill = 'Validation'), alpha = 0.5, position = 'identity') +
+  labs(x = 'TOC', y = 'Count', fill = 'Dataset') +
+  theme_minimal()
+
+ggplot(set_one_train, aes( y = TOC)) +
+  geom_boxplot(aes(x = "Training",fill = 'Train')) +
+  geom_boxplot(data = set_one_val,   aes(x = "Val",y = TOC, fill = 'Validation')) +
+  labs(x = 'Site', y = 'TOC', fill = 'Dataset') +
+  theme_minimal()
+
+nrow(set_one_val)/(nrow(train_val))
+
+# get list of sites in each set
+# cat(paste(unique(set_one_train$id), collapse = ", "))
+# cat(paste(unique(set_one_val$id), collapse = ", "))
+
+set_one <- list(
+  train_data = set_one_train,
+  val_data = set_one_val
+)
+
+saveRDS(set_one, file = 'data/upper_clp_dss/modeling/model_splits/model_one_train_val_split.rds')
+# Load the saved train/val split
+#set_one <- readRDS('data/upper_clp_dss/modeling/model_splits/model_one_train_val_split.rds')
+```
+## Model two
+
+Training sites: pbd, sfm, lbea, penn, pfal, archery_virridy, joei, chd, elc, riverbluffs, archery, riverbend, salyer, 105075538, 105075545, 105075552, 105075569, 105075583, 105075624
+Validation sites: udall, cbri, 105075514, 105075600
+
+```{r}
+
+set_two_val <- train_val%>%
+  filter(id %in% c("udall", "cbri", "105075514" ,  "105075600"))
+set_two_train <- train_val %>%
+  anti_join(set_two_val, by = 'id')
+
+ggplot(set_two_train, aes(x = TOC)) +
+  geom_histogram(aes(fill = 'Train'), alpha = 0.5, position = 'identity') +
+  geom_histogram(data = set_two_val, aes(x = TOC, fill = 'Validation'), alpha = 0.5, position = 'identity') +
+  labs(x = 'TOC', y = 'Count', fill = 'Dataset') +
+  theme_minimal()
+ggplot(set_two_train, aes( y = TOC)) +
+  geom_boxplot(aes(x = "Training",fill = 'Train')) +
+  geom_boxplot(data = set_two_val,   aes(x = "Val",y = TOC, fill = 'Validation')) +
+  labs(x = 'Site', y = 'TOC', fill = 'Dataset') +
+  theme_minimal()
+
+nrow(set_two_val)/nrow(train_val)
+# get list of sites in each set
+ cat(paste(unique(set_two_train$id), collapse = ", "))
+ cat(paste(unique(set_two_val$id), collapse = ", "))
+set_two <- list(
+  train_data = set_two_train,
+  val_data = set_two_val
+)
+
+saveRDS(set_two, file = 'data/upper_clp_dss/modeling/model_splits/model_two_train_val_split.rds')
+# Load the saved train/val split
+#set_two <- readRDS('data/upper_clp_dss/modeling/model_splits/model_two_train_val_split.rds')
+```
+
+## Model Three
+
+Training sites:
+sfm, lbea, archery_virridy, cbri, joei, elc, riverbluffs, riverbend, salyer, 105075514, 105075538, 105075545, 105075552, 105075583, 105075600
+Validation sites:
+udall, archery_virridy, pbd, 105075545                udall, cbri, 105075514, 105075600 penn, pfal, chd,  105075569
+
+```{r}
+
+set_three_val <- train_val%>%
+  filter(id %in% c( "archery_virridy","pbd", "105075583", "105075624"))
+set_three_train <- train_val %>%
+  anti_join(set_three_val, by = 'id')
+
+ggplot(set_three_train, aes(x = TOC)) +
+  geom_histogram(aes(fill = 'Train'), alpha = 0.5, position = 'identity') +
+  geom_histogram(data = set_three_val, aes(x = TOC, fill = 'Validation'), alpha = 0.5, position = 'identity') +
+  labs(x = 'TOC', y = 'Count', fill = 'Dataset') +
+  theme_minimal()
+ggplot(set_three_train, aes( y = TOC)) +
+  geom_boxplot(aes(x = "Training",fill = 'Train')) +
+  geom_boxplot(data = set_three_val,   aes(x = "Val",y = TOC, fill = 'Validation')) +
+  labs(x = 'Site', y = 'TOC', fill = 'Dataset') +
+  theme_minimal()
+
+nrow(set_three_val)/nrow(train_val)
+
+
+set_three <- list(
+  train_data = set_three_train,
+  val_data = set_three_val
+)
+
+saveRDS(set_three, file = 'data/upper_clp_dss/modeling/model_splits/model_three_train_val_split.rds')
+# Load the saved train/val split
+#set_three <- readRDS('data/upper_clp_dss/modeling/model_splits/model_three_train_val_split.rds')
+```
+
+# Model one
+
+## Model prep
+```{r}
+train <- set_one$train_data
+val <- set_one$val_data
+
+features <- c('FDOM', 'Sensor_Turb', "log_sensor_turb", 'Sensor_Cond', 'Chl_a','Temp','f_c_turb', "log_chl_a" )
+target <- 'TOC'
+
+
+train_xg <- xgb.DMatrix(data = as.matrix(train[,features]), 
+                      label = as.matrix(train[,target]))
+
+val_xg <- xgb.DMatrix(data = as.matrix(val[,features]), 
+                     label = as.matrix(val[,target]))
+
+
+```
+
+## Hyperparameter Tuning
+Modified from Sam Sillen's script to hyper tune RS Model: https://zenodo.org/records/11582790
+
+```{r}
+grid_train <- expand.grid(
+  max_depth= c(2, 3,4),
+  subsample = c(0.5, .8),
+  colsample_bytree= c( 0.5,.8),
+  eta = c(0.001, 0.1), #add all the way to 0.0001 ?
+  min_child_weight= c(2,4,6), 
+  gamma = c( .6)
+)
+
+xgboost_hypertuning_complete <- function(train_data, val_data, grid) {
+  
+  # Internal function to train a single model
+  hypertune_xgboost <- function(train, test, grid_row) {
+    params <- list(
+      booster = "gbtree", 
+      objective = "reg:squarederror", 
+      eta = grid_row$eta,
+      max_depth = grid_row$max_depth, 
+      min_child_weight = grid_row$min_child_weight, 
+      subsample = grid_row$subsample, 
+      colsample_bytree = grid_row$colsample_bytree, 
+      gamma = grid_row$gamma
+    )
+    
+    xgb.naive <- xgb.train(
+      params = params, 
+      data = train, 
+      nrounds = 10000, 
+      watchlist = list(train = train, val = test), 
+      early_stopping_rounds = 200,
+      verbose = 0  # Suppress output
+    )
+    
+    return(xgb.naive) 
+  }
+  
+  # Train all models using grid parameters
+  xgboost_models <- grid %>%
+    pmap(function(...) {
+      current <- tibble(...)
+      hypertune_xgboost(train_data, val_data, current)
+    })
+  
+  # Parse model results
+  results <- map_dfr(xgboost_models, function(model) {
+    tibble(
+      evaluation_log = list(model[["evaluation_log"]]),
+      best_iteration = model[["best_iteration"]],
+      best_score = model[["best_score"]],
+      best_msg = model[["best_msg"]]
+    )
+  }, .id = "model_id") %>%
+    bind_rows() %>%
+    mutate(
+      # Extract iteration number (digits in brackets)
+      best_iter = as.numeric(str_extract(best_msg, "(?<=\\[)\\d+(?=\\])")),
+      
+      # Extract train-rmse value
+      train_perf = as.numeric(str_extract(best_msg, "(?<=train-rmse:)[0-9.]+(?=\\s)")),
+      
+      # Extract val-rmse value  
+      val_perf = as.numeric(str_extract(best_msg, "(?<=val-rmse:)[0-9.]+")),
+      
+      # Compute distance
+      val_train_dist = val_perf - train_perf 
+    ) %>%
+    bind_cols(grid)
+  
+  # Return both models and parsed results
+  return(list(
+    models = xgboost_models,
+    results = results
+  ))
+}
+
+all_model_runs <- xgboost_hypertuning_complete(train_xg, val_xg, grid_train)
+
+```
+
+## Find median performance and dist between train/val
+
+```{r}
+results <- all_model_runs$results 
+
+# dist of performance
+ggplot(results)+
+  geom_histogram(aes(x = train_perf,), fill = 'blue')+
+  geom_histogram(aes(x = val_perf), fill = 'red')+
+  labs(x = "RMSE")
+
+
+#All medians
+median_train_perf <- median(results$train_perf, na.rm = TRUE)
+median_val_perf <- median(results$val_perf, na.rm = TRUE)
+median_dist <- median(results$val_train_dist, na.rm = TRUE)
+# All mins
+min_train_perf <- min(results$train_perf, na.rm = TRUE)
+min_val_perf <- min(results$val_perf, na.rm = TRUE)
+min_dist <- min(results$val_train_dist, na.rm = TRUE)
+
+cat("Median Training RMSE:", median_train_perf, "\n",
+    "Median Validation RMSE:", median_val_perf, "\n",
+    "Median Distance between Validation and Training RMSE:", median_dist, "\n")
+
+cat("Min Training RMSE:", min_train_perf, "\n",
+    "Min Validation RMSE:", min_val_perf, "\n",
+    "Median Distance between Validation and Training RMSE:", min_dist, "\n")
+
+```
+
+### Select better than average models & view performance plots
+
+```{r}
+
+select_xgboost_hypertune <- results %>%
+  arrange(val_perf) %>%
+  # Take top 10 lowest validation performers
+  slice_head(n = 15) %>%
+  # Among those, rank by distance and take top 5 lowest distance
+  arrange(val_train_dist) %>%
+  slice_head(n = 10) # Select models with validation RMSE better than median
+
+best_plots <- create_performance_plots(model_dataframe = select_xgboost_hypertune)
+
+create_combined_plot(best_plots[1:5], ncol = 2, title = "XGBoost Model Comparison - Best Models")
+create_combined_plot(best_plots[6:10], ncol = 2, title = "XGBoost Model Comparison - Best Models")
+
+
+```
+
+
+### Run Model with best parameters and evaluate performance
+
+
+```{r}
+# Best parameters for the model
+ best_model <- all_model_runs[["models"]][[58]]$params
+
+# best_model <- tibble(
+#   max_depth= 2,
+#   subsample = 0.5,
+#   colsample_bytree= 0.5,
+#   eta = 0.1, 
+#   min_child_weight= 6,
+#   lambda = 1,
+#   alpha = 1
+# )
+
+best_params <- list(booster = "gbtree", objective = "reg:squarederror",
+               eta=best_model$eta,
+               max_depth=best_model$max_depth, 
+               min_child_weight=best_model$min_child_weight,
+               subsample=best_model$subsample, 
+               colsample_bytree= best_model$colsample_bytree, 
+               gamma = best_model$gamma)
+
+
+#org run  the boost algo with those settings
+toc_mod_one <- xgb.train(params = best_params, 
+                             data = train_xg, 
+                             nrounds = 10000,
+                             watchlist = list(train = train_xg, 
+                                              val = val_xg), 
+                             print_every_n = 25, 
+                             early_stopping_rounds = 200, 
+                             maximize = F)
+
+
+toc_mod_one$evaluation_log%>%
+  ggplot(aes(x = iter)) +
+  geom_line(aes(y = train_rmse), color = "red") +
+  geom_line(aes(y = val_rmse), color = "blue")+
+  geom_vline(xintercept = toc_mod_one$best_iteration, linetype = 'dashed', color = 'black') 
+#view importance
+head(xgb.importance( model = toc_mod_one))
+
+importance_matrix <- xgb.importance(colnames(train_xg), model = toc_mod_one)
+
+xgb.ggplot.importance(importance_matrix, measure = "Gain", rel_to_first = FALSE)
+#### Plot trees
+
+xgb.plot.tree(model = toc_mod_one, trees = 2)
+```
+
+
+## View Model performance
+
+```{r}
+
+# 
+train$toc_guess <- predict(toc_mod_one, train_xg)
+val$toc_guess <- predict(toc_mod_one, val_xg)
+
+
+
+ggplotly(ggplot(val, aes(x = TOC, y = toc_guess, color = id))+# color = as.character(year))) +
+    geom_point()+
+  geom_abline(slope = 1, intercept = 0, linetype = 'dashed') +
+    labs(x = 'Measured TOC (mg/L)', y = 'Predicted TOC (mg/L)', color = "Site") +
+  xlim(2,10)+
+  ylim(2,10)+
+    ROSS_theme)
+
+test_xg <- xgb.DMatrix(data = as.matrix(testing[,features]), 
+                      label = as.matrix(testing[,target]))
+testing$toc_guess <- predict(toc_mod_one, test_xg)
+
+all_mod_1 <- bind_rows(dplyr::select(train, TOC, toc_guess, sensor_datetime, collector) %>%
+                     mutate(group = 'Train'),
+                     dplyr::select(val, TOC, toc_guess, sensor_datetime, collector) %>%
+                     mutate(group = 'Val'), 
+                     dplyr::select(testing, TOC, toc_guess, sensor_datetime, collector) %>%
+                     mutate(group = 'Test'))
+#calculate the MSE
+mses <- all_mod_1 %>%
+    group_by(group) %>%
+    summarize(rmse = rmse(TOC, toc_guess))%>%
+    mutate(rmse = round(rmse, 3))
+
+val_rmse <- mses%>%
+  filter(group == 'Val')%>%
+  pull(rmse)
+
+
+ROSS_theme <- theme_bw(base_size = 20) + #or theme_few()
+    theme(plot.title = element_text(hjust = 0.5, face = 'bold', family = "Roboto"),
+          plot.subtitle = element_text(hjust = 0.5, family = "Roboto"))
+
+all_mod_1$group <- factor(all_mod_1$group, levels = c('Train', 'Val'))
+all_mod_1$collector <- factor(all_mod_1$collector, levels = c("ROSS", "FC","Virridy"))
+
+min_toc <- min(all_mod_1$TOC, na.rm = T)
+max_toc <- max(all_mod_1$TOC, na.rm = T)
+
+# Calculate dynamic positions for text box
+plot_range <- max_toc - min_toc
+box_width <- plot_range * 0.4  # Box width as 40% of data range
+box_height <- plot_range * 0.15  # Box height as 15% of data range
+
+# Position box in top-left corner with some padding
+box_xmin <- min_toc + plot_range * 0.02  # 2% padding from left
+box_xmax <- box_xmin + box_width
+box_ymax <- max_toc - plot_range * 0.02  # 2% padding from top
+box_ymin <- box_ymax - box_height
+
+# Text positions
+text_x <- (box_xmin + box_xmax) / 2  # Center of box horizontally
+text_y1 <- box_ymax - box_height * 0.15  # Top text line
+text_y2 <- box_ymax - box_height * 0.5   # Middle text line
+text_y3 <- box_ymax - box_height * 0.85  # Bottom text line
+
+
+
+ggplot(all_mod_1, aes(x = TOC, y = toc_guess, color = group, shape = collector)) +
+    annotate("rect", xmin = 0.5, xmax = min_toc, ymin = 0.5, ymax = 10.25,
+             fill = "grey80", alpha = 0.5) +
+    # Right grey box (above max_toc on x-axis)
+    annotate("rect", xmin = max_toc, xmax = 10.25, ymin = 0.5, ymax = 10.25,
+             fill = "grey80", alpha = 0.5) +
+    # Bottom grey box (below min_toc on y-axis)
+    annotate("rect", xmin = 0.5, xmax = 10.25, ymin = 0.5, ymax = min_toc,
+             fill = "grey80", alpha = 0.5) +
+    # Top grey box (above max_toc on y-axis)
+    annotate("rect", xmin = 0.5, xmax = 10.25, ymin = max_toc, ymax = 10.25,
+             fill = "grey80", alpha = 0.5) +
+    #add 1:1 line
+    geom_abline(intercept = 0.1, slope = 1, linetype = 'dashed', lwd = 1.5) +
+  # add a horizontal line at y = toc_max
+  geom_hline(yintercept = max_toc, linetype = 'dashed', color = 'black', size = 0.5) +
+  annotate("text", x = 7, y = max_toc - 0.2, label = "Max TOC Measured",
+         color = "black", size = 4) +
+    geom_point(size = 3, alpha = 0.6) +
+  # add a label in the top left corner
+annotate("rect", xmin = box_xmin, xmax = box_xmax, ymin = box_ymin, ymax = box_ymax,
+         fill = "white", color = "black", alpha = 1, linewidth = 0.5) +
+annotate("text", x = text_x, y = text_y1, label = paste0("Training samples: n = ", nrow(train)),
+         color = "black", size = 4) +
+annotate("text", x = text_x, y = text_y2, label = paste0("Validation samples: n = ", nrow(val)),
+         color = "black", size = 4) +
+annotate("text", x = text_x, y = text_y3, label = paste0("Validation Data RMSE: ", val_rmse, " (mg/L)"),
+         color = "black", fontface = 2, size = 4.5)+
+  #label for 1:1 line
+    scale_color_manual(name = "Model Group", values = c('Train' = "#002EA3", 'Val' = "#E70870"))+
+  scale_shape_manual(name = "Collector", values = c("ROSS" = 15, "FC" = 17,"Virridy" = 19))+
+    ROSS_theme+
+  labs( x = "Measured TOC (mg/L)",
+       y = "Model Estimated TOC (mg/L)",
+       color = "Model Group")+
+  # put the legend in the bottom right corner of the plot (inside the plot)
+  theme(legend.position = c(0.975, 0.05),
+          legend.justification = c("right", "bottom"),
+          legend.box.background = element_rect(color = "black", fill = "white", linewidth = 0.5),
+          legend.margin = margin(6, 6, 6, 6)) +
+  xlim(min_toc,max_toc)+
+  ylim(min_toc,max_toc)
+
+ ggsave('data/upper_clp_dss/modeling/model_splits/figures/model_one_performance.png', width = 10, height = 6, units = 'in', dpi = 500)
+
+```
+
+## Model Save
+```{r}
+
+#save model
+saveRDS(toc_mod_one, paste0("data/upper_clp_dss/modeling/model_splits/toc_xgboost_one_",Sys.Date(),".rds"))
+
+```
+
+# Train all 5 models
+
+```{r}
+features <- c('FDOM', 'Sensor_Turb', "log_sensor_turb", 'Sensor_Cond', 'Chl_a','Temp','f_c_turb', "log_chl_a" )
+target  = "TOC"
+
+model <- xgboost_site_stratified_tuning(
+     data = train_val %>% select(TOC, id, any_of(features)),
+     tune_grid = expand.grid(
+       nrounds = 10000,
+       max_depth = c(2, 3, 4),
+       eta = c(0.005, 0.01, 0.1),
+       gamma = c(0.4, 0.6),
+       colsample_bytree = c(0.5, 0.8),
+       min_child_weight = c(2, 4, 6),
+       subsample = c(0.5, 0.8)
+     ),
+     target_col = "TOC",
+     site_col = "id",
+     n_folds = 5,
+     save_fold_models = TRUE  # Enable fold model saving
+  )
+
+#save model splits
+write_rds(model, paste0("data/upper_clp_dss/modeling/model_splits/toc_xgboost_models_",Sys.Date(),".rds"))
+```
+
+# Save files (smaller)
+```{r}
+
+small_models <- lapply(model, function(x) {
+  m <- x$model   # extract model (xgboost object)
+  
+  #remove large unnecessary elements 
+  if ("trainingData" %in% names(m)) m$trainingData <- NULL
+  if ("call" %in% names(m)) m$call <- NULL
+  if ("terms" %in% names(m)) m$terms <- NULL
+  
+  return(m)
+})
+saveRDS(small_models, file = paste0("data/upper_clp_dss/modeling/model_splits/toc_xgboost_models_light_",Sys.Date(),".rds"))
+
+```
+
+
+# Calculate performance and apply to testing set
+
+```{r}
+# Copy testing data
+preds_tbl <- testing%>%
+  mutate(group = "Test")
+preds_tbl_train <- train_val%>%
+  mutate(group = "Train")
+
+# Add predictions from each fold model as new columns
+for (i in seq_along(model)) {
+  fold_model <- model[[i]]$model
+  col_name <- glue("{target}_guess_fold{i}")
+  preds_tbl[[col_name]] <- predict(fold_model, preds_tbl)
+  preds_tbl_train[[col_name]] <- predict(fold_model, preds_tbl_train)
+}
+
+fold_cols <- glue("{target}_guess_fold{seq_along(model)}")
+ensemble_col <- glue("{target}_guess_ensemble")
+preds_tbl[[ensemble_col]] <- rowMeans(preds_tbl[, fold_cols])
+preds_tbl_train[[ensemble_col]] <- rowMeans(preds_tbl_train[, fold_cols])
+
+#Join
+all_preds <- bind_rows(preds_tbl, preds_tbl_train)
+
+#compute metrics
+metrics_tbl <- map_dfr(c(seq_along(model), "mean"), function(f) {
+  col_name <- if (f == "mean") glue(ensemble_col) else glue("{target}_guess_fold{f}")
+
+  all_preds %>%
+    group_by(group) %>%
+    summarise(
+      model = as.character(f),
+      rmse = rmse(.data[[target]], .data[[col_name]]),
+      mae  = mae(.data[[target]], .data[[col_name]]),
+      bias = bias(.data[[target]], .data[[col_name]]),
+      .groups = "drop"
+    )
+})
+
+metrics_tbl
+
+
+```
+
+
+
+# Visualize
+
+```{r}
+# Function to generate a plot for a given prediction column
+plot_fold <- function(pred_col, data, fold_name) {
+  
+  test_data <- data %>%filter(group == "Test")
+  # Calculate RMSE for annotation
+  test_rmse <- rmse(test_data[[target]], test_data[[pred_col]]) %>% round(3)
+  test_mae <- mae(test_data[[target]], test_data[[pred_col]]) %>% round(3)
+
+  
+  min_val <- min(data[[target]], na.rm = TRUE)
+  max_val <- max(data[[target]], na.rm = TRUE)
+  plot_range <- max_val - min_val
+  
+  box_width <- plot_range * 0.4
+  box_height <- plot_range * 0.15
+  box_xmin <- min_val + plot_range * 0.02
+  box_xmax <- box_xmin + box_width
+  box_ymax <- max_val - plot_range * 0.02
+  box_ymin <- box_ymax - box_height
+  text_x <- (box_xmin + box_xmax) / 2
+  text_y1 <- box_ymax - box_height * 0.15
+  text_y2 <- box_ymax - box_height * 0.5
+  text_y3 <- box_ymax - box_height * 0.85
+  
+ ggplot(data, aes(x = .data[[target]], y = .data[[pred_col]], color = group)) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", size = 1.2) +
+  
+  # Training points (all same shape)
+  geom_point(
+    data = filter(data, group == "Train"),
+    shape = 16,  # solid circle
+    size = 4,
+    alpha = 0.6) +  
+   geom_point( # Testing points (shape by id)
+    data = filter(data, group == "Test"),
+    shape = 17,
+    #aes(shape = id),
+    size = 4,
+    alpha = 0.9
+  ) +
+    annotate("rect", xmin = box_xmin, xmax = box_xmax, ymin = box_ymin, ymax = box_ymax,
+             fill = "white", color = "black", alpha = 1, linewidth = 0.5) +
+    annotate("text", x = text_x, y = text_y1, label = paste0("Training samples: n = ", (nrow(data)- nrow(test_data))),
+             color = "black", size = 4) +
+    annotate("text", x = text_x, y = text_y2, label = paste0("Testing samples: n = ", nrow(test_data)),
+             color = "black", size = 4) +
+    annotate("text", x = text_x, y = text_y3, label = paste0("Testing RMSE: ", test_rmse, 
+                                                             " mg/L, MAE:", test_mae, " mg/L"),
+             color = "black", fontface = 2, size = 4.5) +
+    scale_color_manual(values = c("Train" = "#002EA3", "Test" = "#E70870")) +
+    #scale_shape_manual(values = c("ROSS" = 15, "FC" = 17, "Virridy" = 19)) +
+    labs(
+      x = "Measured TOC (mg/L)",
+      y = "Predicted TOC (mg/L)",
+      color = "Model Group",
+      shape = "Site",
+      title = fold_name
+    ) +
+    theme_bw(base_size = 16) +
+    xlim(min_val, max_val) +
+    ylim(min_val, max_val) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      legend.position = c(0.975, 0.05),
+      legend.justification = c("right", "bottom"),
+      legend.box.background = element_rect(color = "black", fill = "white"),
+      legend.margin = margin(6, 6, 6, 6)
+    )
+}
+
+
+# 1. Plot each fold
+for (i in seq_along(fold_cols)) {
+  p <- plot_fold(fold_cols[i], all_preds, fold_name = paste0("Fold ", i))
+  plot(p)
+  ggsave(glue("data/upper_clp_dss/modeling/model_splits/figures/model_fold_{i}.png"),
+       plot = p, width = 10, height = 6, dpi = 500)
+}
+
+# 2. Plot ensemble
+p_ensemble <- plot_fold(ensemble_col, all_preds, fold_name = "Ensemble")
+plot(p_ensemble)
+ggsave("data/upper_clp_dss/modeling/model_splits/figures/model_ensemble.png",
+       plot = p_ensemble, width = 12, height = 12, dpi = 500)
+```
+

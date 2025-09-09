@@ -10,8 +10,6 @@ server <- function(input, output, session) {
     flow_sites = NULL,
     last_refresh = Sys.time()
   )
-  loaded_data <- reactiveVal()
-
 
   output$dynamic_load_button <- renderUI({
     div(
@@ -23,20 +21,29 @@ server <- function(input, output, session) {
     )
   })
 
+  #setup loaded data
+  loaded_data <- reactiveVal(NULL)
 
-  #### Loading API Data ####
-  loaded_data <- eventReactive(input$load_data, {
-    req(input$date_range, input$sites_select, input$parameters_select)
-
-
-    sites_sel <- filter(site_table, site_name %in% input$sites_select )%>%
-      pull(site_code)
-
-    # Validate inputs
+  #### Pre loading API/Cached Data ####
+  observe({
     withProgress(message = "Retrieving CLP WQ Data...", {
 
-      start_DT <- as.POSIXct(paste0(input$date_range[1], " 00:01"), tz = "America/Denver")
-      end_DT <- as.POSIXct(paste0(input$date_range[2], " 23:55"), tz = "America/Denver")
+      # read inputs once at startup
+      date_range <- isolate(input$date_range)
+      sites_select <- isolate(input$sites_select)
+      parameters_select <- isolate(input$parameters_select)
+
+      req(date_range, sites_select, parameters_select)
+
+      sites_sel <- filter(site_table, site_name %in% sites_select) %>%
+        pull(site_code)
+
+      #TODO: read in cached data from GH
+
+      #TODO: Start DT should be based on max(cached_data$DT_round_MT)
+      start_DT <- as.POSIXct(paste0(date_range[1], " 00:01"), tz = "America/Denver")
+      end_DT   <- as.POSIXct(paste0(date_range[2], " 23:55"), tz = "America/Denver")
+
 
       #### WET API Pull ####
       #check to see if we need to pull WET data
@@ -53,23 +60,25 @@ server <- function(input, output, session) {
 
         # Code to actually pull in from API
         #Pull in data
-        # wet_data <- map(sites,
-        #                 ~pull_wet_api(
-        #                   target_site = .x,
-        #                   start_datetime = start_DT,
-        #                   end_datetime = end_DT,
-        #                   data_type = "all",
-        #                   time_window = "all"
-        #                 )) %>%
-        #   rbindlist()
+        wet_data <- map(sites,
+                        ~pull_wet_api(
+                          target_site = .x,
+                          start_datetime = start_DT,
+                          end_datetime = end_DT,
+                          data_type = "all",
+                          time_window = "all"
+                        )) %>%
+          rbindlist()%>%
+          filter(value %nin% invalid_values, !is.na(value)) %>%
+          split(f = list(.$site, .$parameter), sep = "-")
 
         #Saving to parquet file for faster loading later on
         #arrow::write_parquet(wet_data, paste0("data/wet_testing_subset_",as.Date(start_DT),"_",as.Date(end_DT),".parquet"))
         #Pre loading API pulled data for faster displaying
-        wet_data <- read_parquet(file = "data/wet_testing_subset_2025-06-22_2025-08-08.parquet")%>%   #Update dates as needed
-          #remove invalid values or NAs
-          filter(value %nin% invalid_values, !is.na(value)) %>%
-          split(f = list(.$site, .$parameter), sep = "-")
+        #wet_data <- read_parquet(file = "data/wet_testing_subset_2025-06-22_2025-08-08.parquet")%>%   #Update dates as needed
+        #remove invalid values or NAs
+        # filter(value %nin% invalid_values, !is.na(value)) %>%
+        # split(f = list(.$site, .$parameter), sep = "-")
 
 
       }else{
@@ -87,76 +96,79 @@ server <- function(input, output, session) {
         incProgress(0.4, detail = "Importing to HydroVu Data...")
 
         # Code to actually pull in from API
-        # # Set up parallel processing
-        # num_workers <- min(availableCores() - 1, 4) # Use at most 4 workers
-        # plan(multisession, workers = num_workers)
-        # furrr_options(
-        #   globals = TRUE,
-        #   packages = c("arrow", "data.table", "httr2", "tidyverse", "lubridate", "zoo",
-        #                "padr", "stats", "RcppRoll", "yaml", "here", "fcw.qaqc")
-        # )
+        # Set up parallel processing
+        num_workers <- min(availableCores() - 1, 4) # Use at most 4 workers
+        plan(multisession, workers = num_workers)
+        furrr_options(
+          globals = TRUE,
+          packages = c("arrow", "data.table", "httr2", "tidyverse", "lubridate", "zoo",
+                       "padr", "stats", "RcppRoll", "yaml", "here", "fcw.qaqc")
+        )
 
         # # suppress scientific notation to ensure consistent formatting
-        # options(scipen = 999)
-        #
-        # # Establishing staging directory - Replacing with temp_dir()
-        # staging_directory = tempdir()
-        #
-        # # Read in credentials
-        # hv_creds <- read_yaml("creds/HydroVuCreds.yml")
-        # hv_token <- hv_auth(client_id = as.character(hv_creds["client"]),
-        #                     client_secret = as.character(hv_creds["secret"]))
-        #
-        # # Pulling in the data from hydrovu
-        # # Making the list of sites that we need
-        # hv_sites <- hv_locations_all(hv_token) %>%
-        #   filter(!grepl("vulink", name, ignore.case = TRUE)) %>%
-        #   #sondes with 2024 in the name can be avoided to speed up the live data pull
-        #   #these should be included in the historical data pull
-        #   filter(!grepl("2024", name, ignore.case = TRUE))
-        #
-        # walk(sites,
-        #      function(site) {
-        #        message("Requesting HV data for: ", site)
-        #        api_puller(
-        #          site = site,
-        #          network = "all",
-        #          start_dt = with_tz(start_DT, tzone = "UTC"), # api puller needs UTC dates
-        #          end_dt = with_tz(end_DT, tzone = "UTC"),
-        #          api_token = hv_token,
-        #          hv_sites_arg = hv_sites,
-        #          dump_dir = staging_directory
-        #        )
-        #      }
-        # )
+        options(scipen = 999)
+
+        # Establishing staging directory - Replacing with temp_dir()
+        staging_directory = tempdir()
+
+        # Read in credentials
+        hv_creds <- read_yaml("creds/HydroVuCreds.yml")
+        hv_token <- hv_auth(client_id = as.character(hv_creds["client"]),
+                            client_secret = as.character(hv_creds["secret"]))
+
+        # Pulling in the data from hydrovu
+        # Making the list of sites that we need
+        hv_sites <- hv_locations_all(hv_token) %>%
+          filter(!grepl("vulink", name, ignore.case = TRUE)) %>%
+          #sondes with 2024 in the name can be avoided to speed up the live data pull
+          #these should be included in the historical data pull
+          filter(!grepl("2024", name, ignore.case = TRUE))
+
+        walk(sites,
+             function(site) {
+               message("Requesting HV data for: ", site)
+               api_puller(
+                 site = site,
+                 network = "all",
+                 start_dt = with_tz(start_DT, tzone = "UTC"), # api puller needs UTC dates
+                 end_dt = with_tz(end_DT, tzone = "UTC"),
+                 api_token = hv_token,
+                 hv_sites_arg = hv_sites,
+                 dump_dir = staging_directory
+               )
+             }
+        )
         #
         # # read in data from staging directory
-        # hv_data <- list.files(staging_directory, full.names = TRUE, pattern = ".parquet") %>%
-        #   map_dfr(function(file_path){
-        #     site_df <- read_parquet(file_path, as_data_frame = TRUE)
-        #     return(site_df)
-        #   }) %>%
-        #   #doing some clean up
-        #   select(-id) %>%
-        #   mutate(units = as.character(units)) %>%
-        #   #double check that Vulink data has been removed
-        #   filter(!grepl("vulink", name, ignore.case = TRUE)) %>%
-        #   mutate(
-        #     DT = timestamp, #timestamp comes in UTC
-        #     DT_round = round_date(DT, "15 minutes"), #rounding
-        #     #DT_round_MT = with_tz(DT_round, tzone = "America/Denver"),
-        #     DT_join = as.character(DT_round), #keeping in UTC but character form
-        #     site = tolower(site)) %>%
-        #   select(-name) %>%
-        #   distinct(.keep_all = TRUE)
+        hv_data <- list.files(staging_directory, full.names = TRUE, pattern = ".parquet") %>%
+          map_dfr(function(file_path){
+            site_df <- read_parquet(file_path, as_data_frame = TRUE)
+            return(site_df)
+          }) %>%
+          #doing some clean up
+          select(-id) %>%
+          mutate(units = as.character(units)) %>%
+          #double check that Vulink data has been removed
+          filter(!grepl("vulink", name, ignore.case = TRUE)) %>%
+          mutate(
+            DT = timestamp, #timestamp comes in UTC
+            DT_round = round_date(DT, "15 minutes"), #rounding
+            #DT_round_MT = with_tz(DT_round, tzone = "America/Denver"),
+            DT_join = as.character(DT_round), #keeping in UTC but character form
+            site = tolower(site)) %>%
+          select(-name) %>%
+          distinct(.keep_all = TRUE)%>%
+          split(f = list(.$site, .$parameter), sep = "-") %>%
+          keep(~nrow(.) > 0)
 
 
         #Saving to parquet file for faster loading later on
         #arrow::write_parquet(hv_data, paste0("data/hv_testing_subset_",as.Date(start_DT),"_",as.Date(end_DT),".parquet"))
         #Pre loading API pulled data for faster displaying
-        hv_data <- read_parquet(file = "data/hv_testing_subset_2025-06-22_2025-08-08.parquet")%>%   #Update dates as needed
-          split(f = list(.$site, .$parameter), sep = "-") %>%
-          keep(~nrow(.) > 0)
+        # hv_data <- read_parquet(file = "data/hv_testing_subset_2025-06-22_2025-08-08.parquet")%>%   #Update dates as needed
+        #   split(f = list(.$site, .$parameter), sep = "-") %>%
+        #   keep(~nrow(.) > 0)
+
       }else{
         hv_data <- list()
       }
@@ -166,33 +178,30 @@ server <- function(input, output, session) {
       #check to see if we need to access contrail
       if(any(c("pbr_fc", "pman_fc") %in% sites_sel)) {
         incProgress(0.7, detail = "Importing Contrail Data...")
-        #
-        #         # Define sites to pull data for
-        #         contrail_sites <- c("pbr_fc", "pman_fc")
-        #         #grab the sites from sites_sel
-        #         sites <- sites_sel[sites_sel %in% contrail_sites]
-        #
-        #         trim_sites <- toupper(gsub("_fc", "", sites))
-        #
-        #         # Read credentials
-        #         creds <- read_yaml("creds/contrail_creds.yml") %>%
-        #           unlist()
-        #         username <- as.character(creds["username"])
-        #         password <- as.character(creds["password"])
-        #
-        #         contrail_api_urls <- read_csv("creds/contrail_device_urls.csv", show_col_types = F)%>%
-        #           filter(site_code %in% trim_sites)
-        #         # Define the folder path where the CSV files are stored
-        #         # Call the downloader function
-        #         contrail_data <- pull_contrail_api(start_DT, end_DT, username, password, contrail_api_urls) %>%
-        #           rbindlist()
+
+        # Define sites to pull data for
+        contrail_sites <- c("pbr_fc", "pman_fc")
+        #grab the sites from sites_sel
+        sites <- sites_sel[sites_sel %in% contrail_sites]
+
+        trim_sites <- toupper(gsub("_fc", "", sites))
+
+        # Read/set up credentials
+        creds <- yaml::read_yaml( "creds/contrail_creds.yml") %>%
+          unlist()
+        username <- as.character(creds["username"])
+        password <- as.character(creds["password"])
+        login_url <- as.character(creds["login_url"])
+
+        # Call the downloader function
+        contrail_data <- pull_contrail_api(start_DT, end_DT, username,password, login_url)
 
         #Saving to parquet file for faster loading later on
         #arrow::write_parquet(contrail_data, paste0("data/contrail_testing_subset_",as.Date(start_DT),"_",as.Date(end_DT),".parquet"))
         #Pre loading API pulled data for faster displaying
-        contrail_data <- read_parquet(file = "data/contrail_testing_subset_2025-06-22_2025-08-08.parquet")%>%   #Update dates as needed
-          split(f = list(.$site, .$parameter), sep = "-") %>%
-          keep(~nrow(.) > 0)
+        # contrail_data <- read_parquet(file = "data/contrail_testing_subset_2025-06-22_2025-08-08.parquet")%>%   #Update dates as needed
+        #   split(f = list(.$site, .$parameter), sep = "-") %>%
+        #   keep(~nrow(.) > 0)
 
       }else{
         contrail_data <- list()
@@ -203,6 +212,7 @@ server <- function(input, output, session) {
       incProgress(0.9, detail = "Processing data...")
       # combine all data
       all_data_raw <- c(hv_data, wet_data, contrail_data)
+
 
       # remove stage data
       list_names <- names(all_data_raw)
@@ -234,190 +244,27 @@ server <- function(input, output, session) {
                end_DT = with_tz(end_DT, tzone = "UTC"))
 
       # Add the field note data to all of the data
-      #TODO: check in with FC about their field note taking so we can try to add that in later on
-
       combined_data <- tidy_data %>%
-        map(~add_field_notes(df = ., notes = all_field_notes), .progress = TRUE)
+        map(~add_field_notes(df = ., notes = all_field_notes), .progress = TRUE)%>%
+        bind_rows()%>%
+        mutate(auto_flag = NA,
+               mal_flag = NA)
+#TODO: add in any other columns needed?
 
-      # # Add summary statistics
-      summarized_data <- combined_data %>%
-        map(~generate_summary_statistics(.))
+#TODO: Bind with cached data (psuedo code below)
+      #dashboard_data <- bind_rows(cached_dataset, combined_data)
 
-      # Write summarized data to a file
-      #write_rds(summarized_data, paste0("data/summarized_data_subset_",as.Date(start_DT),"_",as.Date(end_DT),".rds"))
-      return(summarized_data)
-      #DO NOT RUN#
-      #### Start of QAQC Demo Code ####
+      #TODO: Remove when cached data is  correctly bound
+      dashboard_data <- combined_data
+      # Set the loaded data
+      incProgress(1, detail = "Data Loaded")
 
-
-      # # Configure your threshold files
-      # sensor_thresholds_file <- "metadata/sensor_spec_thresholds.yml"
-      # seasonal_thresholds_file <- "metadata/updated_seasonal_thresholds_2025.csv"
-      # # read threshold data
-      # sensor_thresholds <- read_yaml(sensor_thresholds_file)
-      # season_thresholds <- read_csv(seasonal_thresholds_file, show_col_types = FALSE)
-      #
-      # # process data in chunks for memory efficiency
-      # summarized_data_chunks <- split(1:length(summarized_data),
-      #                                 ceiling(seq_along(1:length(summarized_data))/10))
-
-      # # Read in summarized data for dashboard
-      # summarized_data <- read_rds("dashboard/data/summarized_data_subset_2025-06-22-2025-08-08.rds")
-      # #remove ORP data
-      # summarized_data <- summarized_data %>%
-      #   keep_at(imap_lgl(., ~ !grepl("ORP", .y)))
-      #
-      # # process data in chunks for memory efficiency
-      # summarized_data_chunks <- split(1:length(summarized_data),
-      #                                 ceiling(seq_along(1:length(summarized_data))/8))
-      #
-      # single_sensor_flags <- list()
-      #
-      # for (chunk_idx in seq_along(summarized_data_chunks)) {
-      #   message("\n=== Processing chunk ", chunk_idx, " of ", length(summarized_data_chunks), " ===")
-      #
-      #   indices <- summarized_data_chunks[[chunk_idx]]
-      #   chunk_data <- summarized_data[indices]
-      #
-      #   # apply single-parameter flags
-      #   chunk_results <- chunk_data %>%
-      #     future_map(
-      #       function(data) {
-      #         flagged_data <- data %>%
-      #           data.table(.) %>%
-      #           # flag field visits
-      #           add_field_flag(df = .) %>%
-      #           # flag missing/NA values
-      #           add_na_flag(df = .) %>%
-      #           # flag dissolved oxygen noise patterns
-      #           find_do_noise(df = .) %>%
-      #           # # flag repeating/stuck values
-      #           # add_repeat_flag(df = .) %>%
-      #           # # flag depth shifts (sonde movement)
-      #           # add_depth_shift_flag(df = ., level_shift_table = all_field_notes, post2024 = TRUE) %>%
-      #           # flag sensor drift (FDOM, Chl-a, Turbidity)
-      #           add_drift_flag(df = .)
-      #
-      #         # apply sensor specification flags if thresholds exist
-      #         if (unique(data$parameter) %in% names(sensor_thresholds)) {
-      #           flagged_data <- flagged_data %>%
-      #             data.table(.) %>%
-      #             add_spec_flag(df = ., spec_table = sensor_thresholds)
-      #         }
-      #
-      #         # apply seasonal threshold flags if available
-      #         if (unique(data$parameter) %in% unique(season_thresholds$parameter)) {
-      #           flagged_data <- flagged_data %>%
-      #             data.table(.) %>%
-      #             add_seasonal_flag(df = ., threshold_table = season_thresholds)
-      #         }
-      #
-      #         return(flagged_data)
-      #       },
-      #       .progress = TRUE
-      #     )
-      #
-      #   single_sensor_flags <- c(single_sensor_flags, chunk_results)
-      #
-      #   if (chunk_idx < length(summarized_data_chunks)) {
-      #     gc()  # garbage collection between chunks
-      #     Sys.sleep(0.1)
-      #   }
-      # }
-      #
-      # # combine single-parameter flags by site
-      # intrasensor_flags <- single_sensor_flags %>%
-      #   rbindlist(fill = TRUE) %>%
-      #   split(by = "site")
-      #
-      # # process inter-parameter flags in chunks
-      # intrasensor_data_chunks <- split(1:length(intrasensor_flags),
-      #                                  ceiling(seq_along(1:length(intrasensor_flags))/1))
-      #
-      # intrasensor_flags_list <- list()
-      # for (chunk_idx in seq_along(intrasensor_data_chunks)) {
-      #   message("\n=== Processing chunk ", chunk_idx, " of ", length(intrasensor_data_chunks), " ===")
-      #
-      #   indices <- intrasensor_data_chunks[[chunk_idx]]
-      #   chunk_data <- intrasensor_flags[indices]
-      #
-      #   chunk_results <- chunk_data %>%
-      #     map(
-      #       function(data) {
-      #         flagged_data <- data %>%
-      #           data.table() %>%
-      #           # flag when water temperature below freezing
-      #           add_frozen_flag(.) %>%
-      #           # check for overlapping flags and resolve
-      #           intersensor_check(.) %>%
-      #           # flag potential sensor burial
-      #           add_burial_flag(.) %>%
-      #           # flag when sonde is above water surface
-      #           add_unsubmerged_flag(.)
-      #
-      #         return(flagged_data)
-      #       }
-      #     ) %>%
-      #     rbindlist(fill = TRUE) %>%
-      #     mutate(flag = ifelse(flag == "", NA, flag)) %>%
-      #     split(f = list(.$site, .$parameter), sep = "-") %>%
-      #     purrr::discard(~ nrow(.) == 0)%>%
-      #     # # add known sensor malfunction periods
-      #     map(~add_malfunction_flag(df = ., malfunction_records = sensor_malfunction_notes))
-      #
-      #   intrasensor_flags_list <- c(intrasensor_flags_list, chunk_results)
-      #
-      #   if (chunk_idx < length(intrasensor_data_chunks)) {
-      #     gc()
-      #     Sys.sleep(0.1)
-      #   }
-      # }
-      #
-      #
-      # #custom network check while fcw.qaqc package is being updated
-      # source("src/network_check.R")
-      #
-      # # apply network-level quality control
-      # network_flags <- intrasensor_flags_list %>%
-      #   # network check compares patterns across sites
-      #   purrr::map(~network_check(df = .,network = "uclp_dashboard", intrasensor_flags_arg = intrasensor_flags_list)) %>%
-      #   rbindlist(fill = TRUE) %>%
-      #   # clean up flag column formatting
-      #   tidy_flag_column() %>%
-      #   split(f = list(.$site, .$parameter), sep = "-") %>%
-      #   # add suspect data flags for isolated anomalies
-      #   purrr::map(~add_suspect_flag(.)) %>%
-      #   rbindlist(fill = TRUE)
-      #
-      #
-      # # final data cleaning and preparation
-      # v_final_flags <- network_flags %>%
-      #   # Remove isolated suspect flags (single point anomalies)
-      #   dplyr::mutate(auto_flag = ifelse(
-      #     is.na(auto_flag), NA,
-      #     ifelse(auto_flag == "suspect data" &
-      #              is.na(lag(auto_flag, 1)) &
-      #              is.na(lead(auto_flag, 1)), NA, auto_flag)
-      #   )) %>%
-      #   # select final columns
-      #   dplyr::select(c("DT_round", "DT_join", "site", "parameter", "mean", "units",
-      #                   "n_obs", "spread", "auto_flag", "mal_flag", "sonde_moved",
-      #                   "sonde_employed", "season", "last_site_visit")) %>%
-      #   # clean up empty flags
-      #   dplyr::mutate(auto_flag = ifelse(is.na(auto_flag), NA,
-      #                                    ifelse(auto_flag == "", NA, auto_flag))) %>%
-      #   # split back into site-parameter combinations
-      #   split(f = list(.$site, .$parameter), sep = "-") %>%
-      #   keep(~nrow(.) > 0)
-      #### End of QAQC Demo Code ####
-      #preload cleaned dataset for testing
-      # cleaned_data <- read_rds(file = file.path( "data", "all_sensor_subset_flagged_2025-06-22_2025-08-08.rds"))
-      #
-      # return(cleaned_data)
+      loaded_data(dashboard_data)
     })
   })
+
   #### Filtered data reactive val ####
-  filtered_data <- reactive({
+  filtered_data <- eventReactive(input$load_data, {
     req(loaded_data(), input$date_range, input$sites_select, input$parameters_select)
 
     start_DT <- as.POSIXct(paste0(input$date_range[1], " 00:01"), tz = "America/Denver")
@@ -427,12 +274,13 @@ server <- function(input, output, session) {
       pull(site_code)
 
     data <- loaded_data()%>%
-      rbindlist()%>%
       mutate(DT_round_MT = with_tz(DT_round, tzone = "America/Denver"))%>%
       filter(between(DT_round_MT, start_DT, end_DT),
              site %in% sites_sel,
              parameter %in% input$parameters_select)
+#TODO: filter for sonde deployed/sensor malfunctions for ALL DATA
 
+#TODO: this might change as we learn what operators want, but for now just filtering out ALL flagged data
     if(input$apply_qaqc_filter){
       data <- data %>%
         filter(is.na(auto_flag),
@@ -552,8 +400,8 @@ server <- function(input, output, session) {
           data_max <- max(plot_data$mean, na.rm = TRUE)
 
           # Use parameter bounds as default, but extend if data goes outside
-          y_min <- min(param_bounds$lower, data_min)
-          y_max <- max(param_bounds$upper, data_max)
+          y_min <- min(param_bounds$lower, data_min) - 0.2
+          y_max <- max(param_bounds$upper, data_max) + 0.2
 
           # Add small buffer if data exactly matches bounds
           if(data_min >= param_bounds$lower && data_max <= param_bounds$upper) {
@@ -665,7 +513,7 @@ server <- function(input, output, session) {
 
     # Apply TOC model on relevant data
     toc_plot_data <- apply_toc_model(sensor_data = input_data,
-                                     toc_model_file_path = "metadata/toc_xgboost_models_light_2025-08-20.rds",
+                                     toc_model_file_path = "metadata/toc_xgboost_models_light_2025-09-05.rds",
                                      scaling_params_file_path = "metadata/scaling_parameters_20250820.rds",
                                      #summarizing model input results to user selected timestep (15 min -> 1 day)
                                      summarize_interval = input$model_timestep) %>%
@@ -680,12 +528,13 @@ server <- function(input, output, session) {
     toc_plot_data <- toc_plot_data %>%
       arrange(site, DT_round) %>%
       group_by(site) %>%
-      # Applying a 1,1,2,1,1 filter to smooth dataset. Only in areas where there are 5 data points (non NAs) in a sequence
+      # Applying a 1, 4, 6, 4, 1 gaussian filter to smooth dataset. Only in areas where there are 5 data points (non NAs) in a sequence
+
       mutate(
         #Identify windows with NAs
         has_na_window = rollapply(is.na(TOC_guess_ensemble), width = 5,
                                   FUN = any, fill = TRUE, align = "center"),
-
+        #Apply smoothing filter only where no NAs in the 5-point window
         TOC_guess_ensemble_smooth = ifelse(has_na_window | is.na(TOC_guess_ensemble), # Apply filter only where no NAs in the 5-point window
                                            TOC_guess_ensemble,  # Keep original value if NAs present
                                            data.table::frollapply(TOC_guess_ensemble, n = 5, FUN = binomial_kernel,
@@ -702,7 +551,7 @@ server <- function(input, output, session) {
     }else{
       plot_param <- "TOC_guess_ensemble"
     }
-
+    #get sites
     site_list <- unique(toc_plot_data$site_name)
 
     # dynamically create plot containers

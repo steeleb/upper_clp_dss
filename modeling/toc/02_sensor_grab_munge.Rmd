@@ -41,7 +41,7 @@ This comes from the 01_sensor_data_prep.rmd script and should be updated when an
 
 #list.files(path = "data/upper_clp_dss/sensor/prepped/", full.names = TRUE)
 
-all_sensor_data_wide <- read_parquet(file = "data/upper_clp_dss/sensor/prepped/all_sensor_data_2023-09-01_2025-07-15.parquet")
+all_sensor_data_wide <- read_parquet(file = "data/upper_clp_dss/sensor/prepped/all_sensor_data_2023-03-30_2025-08-27.parquet")
 
 ```
 
@@ -74,6 +74,7 @@ ross_water_chem <- zenodo_data[["most_recent_chem"]]%>%
                           site_code == "tamasag" ~ "bellvue",
                           T ~ site_code))%>%
   filter(DT_mst >= as_date("2023-09-01"))%>%
+  distinct()%>%
   dplyr::select(site_code, 
          Date, 
          DT_sample = DT_mst,
@@ -180,6 +181,10 @@ FC_chem <- bind_rows(FC_chem_2022_2024, FC_chem_2025)
 water_chem <- bind_rows(ross_water_chem, FC_chem)%>%
   filter(site_code %in% unique(all_sensor_data_wide$site))
 
+#save for later use
+write_parquet(water_chem, "data/upper_clp_dss/modeling/ROSS_FC_water_chemistry.parquet")
+
+
 # ggplot(water_chem%>%
 #          filter(site_code %in% c("sfm", "chd", "pbr")), aes(x = Date, y = TOC, color = collector)) +
 #   geom_point() +
@@ -195,13 +200,24 @@ water_chem <- bind_rows(ross_water_chem, FC_chem)%>%
 ## plot available data vs water chem
 
 ```{r}
-all_sensor_data_wide%>%
-  #filter(year(DT_round) == 2025)%>%
-  ggplot(aes(x = DT_round, y = data_avail))+
-  geom_point()+
-  #create a vertical line when a sample from water chem was collected
-  geom_vline(data = water_chem%>%rename(site = site_code), aes(xintercept = DT_sample), color = "red")+
-  facet_wrap(~site, scales = "free_y")
+
+
+map(unique(all_sensor_data_wide$site), function(site_sel){
+  p <- all_sensor_data_wide %>%
+    filter(site == site_sel)%>% 
+    mutate(date = as.Date(DT_round)) %>%
+    summarize(data_avail = any(data_avail), .by = "date") %>%
+    ggplot(aes(x = date, y = data_avail)) +
+    geom_point() +
+    geom_vline(data = water_chem %>% 
+                 rename(site = site_code) %>% 
+                 filter(site == site_sel & !is.na(TOC)) %>% 
+                 mutate(date = as.Date(DT_sample)), 
+               aes(xintercept = date), color = "red") +
+    labs(title = paste("Data Availability for Site:", site_sel))
+  
+  print(p)
+})
 
 ```
 
@@ -212,69 +228,59 @@ all_sensor_data_wide%>%
 This works using the wide dataset and finds the most recent (forward looking) 15 minute timestep where all sensor parameters (SC, FDOM, Temp,Chl-a, Turbidity and Depth ) are available. In the instance where there is no data after a sample is collected (ie a sensor is removed for the year), it will find the most recent (backward looking) timestep
 
 ```{r}
-# Function to find the most recent sensor data for each water chem sample
-get_most_recent_sensor_data <- function(water_chem, all_sensor_data_wide) {
+
+final_data <- map(1:nrow(water_chem), function(i) {
+  # Get the current water chemistry row
+  current_row <- water_chem[i, ]
   
-  # Create an empty list to store results
-  result_list <- list()
-  
-  # Loop through each row in water_chem
-  for (i in 1:nrow(water_chem)) {
-    # Get the current water chemistry row
-    current_row <- water_chem[i, ]
-    
-    # Filter the sensor data for the current site
-    site_data <- all_sensor_data_wide %>%
-      filter(site == current_row$site_code) %>%
-      filter(date(DT_round) == date(current_row$DT_sample)) %>%
-      filter(DT_round >= current_row$DT_sample) # Ensure sensor data is later than water chem data
-    
-    # Find the most recent sensor data
-    most_recent_sensor <- site_data %>%
-      arrange(DT_round)%>%
-      slice_head(n = 1)
-    
-    if (nrow(most_recent_sensor) == 0) {
-     # If no matching sensor data found look backwards first
-    site_data <- all_sensor_data_wide %>%
-      filter(site == current_row$site_code) %>%
-      filter(date(DT_round) == date(current_row$DT_sample)) %>%
-      filter(DT_round < current_row$DT_sample) # Ensure sensor data is later than water chem data
-    
-    # Find the most recent sensor data
-    most_recent_sensor <- site_data %>%
-      arrange(DT_round) %>%
-      slice_tail(n = 1)
-    }
-    
-    
-    #If still no matching data is found, add NA values for sensor columns
-    if (nrow(most_recent_sensor) == 0) {
-      most_recent_sensor <- tibble(
-        site = current_row$site_code,
-        DT_round = NA,
-        `Chl-a Fluorescence` = NA,
-        `Specific Conductivity` = NA,
-        Temperature = NA,
-        Turbidity = NA,
-        `FDOM Fluorescence` = NA, 
-        Depth = NA
-      )
-    }
-    
-    # Combine the current water chemistry row with the most recent sensor data
-    result_list[[i]] <- cbind(current_row, most_recent_sensor)
+  if(i/10 == round(i/10)) {
+    cat("Processing row", i, "of", nrow(water_chem), "\n")
   }
   
   
-  # Combine the list of results into a single dataframe
-  final_result <- bind_rows(result_list)
-  
-  return(final_result)
-}
+  #get data from the day of sampling
+  site_data <- all_sensor_data_wide %>%
+  filter(site == current_row$site_code & 
+         date(DT_round) == date(current_row$DT_sample) & 
+         DT_round >= current_row$DT_sample & 
+         data_avail == TRUE)
 
-# Apply the function to get the most recent sensor data for each water chemistry sample
-final_data <- get_most_recent_sensor_data(water_chem, all_sensor_data_wide)%>%
+  # Find the most recent (forward looking) sensor data
+  most_recent_sensor <- site_data %>%
+    filter(DT_round >= current_row$DT_sample)%>%
+    arrange(DT_round) %>%
+    slice_head(n = 1)
+  
+  # If no forward match found, look backwards
+  if (nrow(most_recent_sensor) == 0) {
+    # Find the most recent sensor data (closest before sampling)
+    most_recent_sensor <- site_data %>%
+    filter(DT_round <= current_row$DT_sample)%>%
+      arrange(desc(DT_round)) %>%
+      slice_head(n = 1)
+  }
+  
+  # If still no matching data is found, add NA values
+  if (nrow(most_recent_sensor) == 0) {
+    most_recent_sensor <- tibble(
+      site = current_row$site_code,
+      DT_round = NA,
+      hours_since_last_visit = NA,
+      `Chl-a Fluorescence` = NA,
+      `Specific Conductivity` = NA,
+      Temperature = NA,
+      Turbidity = NA,
+      `FDOM Fluorescence` = NA, 
+      Depth = NA,
+      data_avail = NA
+    )
+  }
+  
+  # Combine the current water chemistry row with the sensor data
+  bind_cols(current_row, most_recent_sensor)
+}) %>% 
+  bind_rows()%>%
+  #fix column names to match virridy
   dplyr::select(mw_id = site_code, 
          sensor_datetime = DT_round, 
          lab_datetime = DT_sample,
@@ -297,13 +303,59 @@ final_data <- get_most_recent_sensor_data(water_chem, all_sensor_data_wide)%>%
 
 ```{r}
 # Count of how many did not match (sensor_datetime is NA)
-final_data %>%
-  filter(!is.na(TOC)) %>%
+TOC_samples <- final_data %>%
+  filter(!is.na(TOC)) 
+
+
+missing_samples <- TOC_samples%>%
   mutate(year = year(lab_datetime))%>%
   group_by(year, mw_id) %>%
   summarise(n_missing = sum(is.na(sensor_datetime)), .groups = "drop")%>%
   arrange(desc(n_missing))
 
+cat("Number of samples with no match up:\n", sum(missing_samples$n_missing), " of ", nrow(TOC_samples), "\n")
+head(missing_samples)
+
+
+```
+
+
+## Create example plot of sensor TS 
+Add grab sample DT as dashed black line and sensor match up as solid red line
+
+```{r}
+
+example_site <- "pfal"
+site_title <- "Poudre Falls"
+
+start_dt <- ymd_hm("2024-06-01 00:00", tz = "MST")
+end_dt <- ymd_hm("2024-07-05 00:00", tz = "MST")
+
+example_data <- all_sensor_data_wide%>%
+  filter(site == example_site)%>%
+  filter(between(DT_round,start_dt, end_dt))%>%
+  mutate(date = as.Date(DT_round))%>%
+  select(-Depth)%>%
+  pivot_longer(cols = c("Chl-a Fluorescence":"Turbidity"), names_to = "parameter", values_to = "value")
+
+example_grab <- final_data%>%
+  filter(mw_id == example_site)%>%
+  filter(between(lab_datetime, start_dt, end_dt))%>%
+  mutate(lab_date = as.Date(lab_datetime),
+         sensor_date = as.Date(sensor_datetime))
+
+example_ts_grab <- ggplot(example_data, aes(x = DT_round, y = value)) +
+  geom_line(color = "#E70870") +
+  geom_vline(data = example_grab, aes(xintercept = lab_datetime), linetype = "dashed", color = "#002EA3") +
+  geom_vline(data = example_grab %>% filter(!is.na(sensor_datetime)), aes(xintercept = sensor_datetime), linetype = "solid", color = "#256BF5") +
+  facet_wrap(~parameter, scales = "free_y", ncol = 1) +
+  labs(title = paste("Example Sensor Time Series at Site:", site_title),
+       x = "Date",
+       y = "Sensor Value") +
+  ROSS_theme
+
+ggsave(plot = example_ts_grab, "data/upper_clp_dss/figures/example_sensor_timeseries_pfal.png",
+       width = 12, height = 8)
 
 ```
 
@@ -318,19 +370,12 @@ virridy_data <- read_csv("data/upper_clp_dss/modeling/parsed_data_virridy.csv")%
   mutate(mw_id = as.character(mw_id))%>%
   mutate(collector = "Virridy")
   
-set.seed(123)
-ross_sites <- tibble(mw_id = unique(final_data$mw_id))%>%
-  mutate(id = sample(1:1000, nrow(.), replace = TRUE))
 
 ROSS_model_data <- final_data%>%
   #removing samples with no match up
   filter(!is.na(sensor_datetime))%>%
-  left_join(ross_sites, by = c("mw_id"))%>%
   mutate(sensor_datetime = as.character(sensor_datetime), 
-         lab_datetime = as.character(lab_datetime), 
-         mw_id = as.character(id))%>%
-  dplyr::select(-id)
-  
+         lab_datetime = as.character(lab_datetime))
 
 
 all_modeled_data <- ROSS_model_data%>%
