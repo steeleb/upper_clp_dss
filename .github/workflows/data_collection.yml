@@ -29,28 +29,15 @@ jobs:
             any::zoo
             any::padr
             any::janitor
-            any::broom
             any::here
+            any::Rcpp
             any::RcppRoll
-            any::trend
-            any::xgboost
-            any::scales
-            any::rvest
             any::httr
             any::httr2
-            any::rjson
-            any::jsonlite
-            any::dataRetrieval
-            any::RSelenium
             any::yaml
-            any::devtools
             any::tidyverse
             any::data.table
             any::arrow
-            any::readxl
-            any::furrr
-            any::Rcpp
-            any::lubridate
             github::ROSSyndicate/fcw.qaqc
       # === DATA COLLATION PHASE ===
       - name: Collate Data
@@ -59,6 +46,9 @@ jobs:
           HYDROVU_CLIENT_ID: ${{ secrets.HYDROVU_CLIENT_ID }}
           HYDROVU_CLIENT_SECRET: ${{ secrets.HYDROVU_CLIENT_SECRET }}
           MWATER_SECRET: ${{secrets.MWATER_SECRET}}
+          CONTRAIL_CLIENT_ID: ${{ secrets.CONTRAIL_CLIENT_ID }}
+          CONTRAIL_CLIENT_SECRET: ${{ secrets.CONTRAIL_CLIENT_SECRET }}
+          CONTRAIL_CLIENT_URL: ${{ secrets.CONTRAIL_CLIENT_URL }}
         run: Rscript src/data_collation_workflow.R
       # === SAVE PHASE ===
       - name: Save - Commit and push results

@@ -172,11 +172,23 @@ hv_data <- list.files(staging_directory, full.names = TRUE, pattern = ".parquet"
 message(paste("....Collation Step Update:", "successfully pulled and munged HydroVu API data"))
 
 ## Contrail Data ----
-# TODO: This
+source(file = here("src", "pull_contrail_api.R"))
+
+contrail_un <- Sys.getenv("CONTRAIL_CLIENT_ID")
+contrail_pw <- Sys.getenv("CONTRAIL_CLIENT_SECRET")
+contrail_url <- Sys.getenv("CONTRAIL_CLIENT_URL")
+
+contrail_data <- pull_contrail_api(
+  start_DT = denver_start_DT,
+  end_DT = denver_end_DT,
+  username = contrail_un,
+  password = contrail_pw,
+  login_url = contrail_url
+  )
 
 # Collating Datasets ----
 # combine all data and remove duplicate site/sensor combos (from log data + livestream)
-all_data_raw <- c(hv_data, wet_data) %>%
+all_data_raw <- c(hv_data, wet_data, contrail_data) %>%
   # c(hv_data, wet_data, contrail_data, log_data) %>%
   bind_rows() %>%
   #convert depth to m for standardization with seasonal thresholds
