@@ -28,7 +28,9 @@ mm_DT <- cached_data %>%
             .groups = "drop") %>%
   filter(max_dt == min(max_dt, na.rm = T)) %>%
   slice(1) %>%
-  pull(max_dt)
+  pull(max_dt) %>%
+  # This prevents data pulling errors from HV
+  {if (format(., "%H:%M:%S") == "00:00:00") . + lubridate::seconds(1) else .}
 
 # Set up dates ----
 # Check mm_DT timezone
@@ -88,7 +90,6 @@ staging_directory = tempdir()
 
 # Read in credentials
 # Get credentials from environment variables (GitHub Secrets)
-# TODO: Set Up GH secrets
 client_id <- Sys.getenv("HYDROVU_CLIENT_ID")
 client_secret <- Sys.getenv("HYDROVU_CLIENT_SECRET")
 # Check if credentials are available
@@ -412,7 +413,6 @@ final_data <- cached_data %>%
   anti_join(v_final_flags, by = c("site", "parameter", "DT_round")) %>%
   bind_rows(v_final_flags) %>%
   arrange(site, parameter, DT_round)
-
 
 # Write to new file ----
 # Save as parquet file
