@@ -64,7 +64,7 @@ if (mm_DT_tz == "UTC") {
 # This comes through the WET API service.
 # Pulled in by the function `pull_wet_api()`.
 invalid_wet_values <- c(-9999, 638.30, -99.99)
-source("src/pull_wet_api.R")
+source(file = here("src", "pull_wet_api.R"))
 
 wet_sites <- c("sfm", "chd", "pfal")
 
@@ -129,7 +129,7 @@ sites <- c("pbd")
 
 # When we are getting all the 2025 data across the network for modeling, use these sites
 #sites <- c("pbd", "salyer", "udall", "riverbend", "cottonwood", "springcreek" , "elc", "boxcreek",  "archery", "riverbluffs")
-source(file = "src/api_puller.R")
+source(file = here("src", "api_puller.R"))
 
 message(paste("....Collation Step Update:", "Attempting to pull data from HydroVu API"))
 walk(sites,

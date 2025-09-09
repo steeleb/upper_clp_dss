@@ -54,6 +54,7 @@ jobs:
             github::ROSSyndicate/fcw.qaqc
       # === DATA COLLATION PHASE ===
       - name: Collate Data
+        working-directory: ./  # Ensure we're in the repo root
         env:
           HYDROVU_CLIENT_ID: ${{ secrets.HYDROVU_CLIENT_ID }}
           HYDROVU_CLIENT_SECRET: ${{ secrets.HYDROVU_CLIENT_SECRET }}
