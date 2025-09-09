@@ -105,7 +105,7 @@ apply_toc_model <- function(sensor_data, toc_model_file_path, scaling_params_fil
 
   # Add predictions from each fold model as new columns
   for (i in seq_along(toc_models)) {
-    fold_model <- toc_models[[i]]$finalModel
+    fold_model <- toc_models[[i]]
     col_name <- glue("{target}_guess_fold{i}")
     model_input_data[[col_name]] <- predict(fold_model, model_input_matrix)
 

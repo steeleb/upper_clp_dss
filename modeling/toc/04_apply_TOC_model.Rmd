@@ -1,0 +1,482 @@
+---
+title: "Applying TOC preds on sensor data"
+author: "Sam Struthers-ROSSyndicate"
+date: "2025-08-01"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+source("src/setup_libraries.R")
+#source("src/TOC_model_train.R")
+library(purrr)
+library(ggplot2)
+library(dplyr)
+library(gridExtra)
+library(grid)
+library(Ckmeans.1d.dp)
+library(DiagrammeR)
+library(Metrics)
+library(caret)
+library(glue)
+set.seed(123)
+
+
+sites <- c("chd", "joei", "cbri", "sfm", "penn", "lbea", "pfal", "pbr", "pman", "pbd", "udall")
+features <- c('FDOM', 'Sensor_Turb', "log_sensor_turb", 'Sensor_Cond', 'Chl_a','Temp','f_c_turb', "log_chl_a" )
+target  = "TOC"
+```
+
+
+Run 03 script to create model then apply to longer/full dataset to see results
+
+
+# Setup
+
+```{r}
+# Load saved scaling parameters
+scaling_params <- readRDS("data/upper_clp_dss/modeling/scaling_parameters_20250820.rds")
+
+# Function to apply the same scaling to new data
+apply_training_scale <- function(new_data, scaling_params) {
+  numeric_cols <- names(select(new_data, where(is.numeric)))
+  
+  scaled_data <- new_data
+  
+  for (col in numeric_cols) {
+    min_val <- scaling_params[[paste0(col, "_min")]]
+    max_val <- scaling_params[[paste0(col, "_max")]]
+    # Apply same min-max scaling as training data
+    scaled_data[[col]] <- (new_data[[col]] - min_val) / (max_val - min_val)
+  }
+  
+  return(scaled_data)
+}
+```
+
+# Read in water chem data
+```{r}
+water_chem <- read_parquet("data/upper_clp_dss/modeling/ROSS_FC_water_chemistry.parquet")%>%
+  mutate(DT_round = round_date(DT_sample, unit = "1 hour" ))%>%
+  rename(site = site_code)%>%
+  filter(collector == "ROSS")
+
+toc_max <- max(water_chem$TOC, na.rm = T)
+
+```
+
+# read in sensor data and format to match model needs
+
+
+```{r}
+#generated in 01 script (all_sensor_data_wide)
+
+prepped_data <- read_parquet("data/upper_clp_dss/sensor/prepped/all_sensor_data_2023-03-30_2025-08-27.parquet")%>%
+  select(site, 
+         DT_round,
+         FDOM = `FDOM Fluorescence`,
+         #hrs_since_last_cleaning = hours_since_last_visit,
+         Temp = Temperature,
+         Sensor_Cond = `Specific Conductivity`,
+         Sensor_Turb = Turbidity,
+         Chl_a = `Chl-a Fluorescence`)%>%
+  filter(site %in% sites)%>% # just grab sites of interest
+  mutate(#capping sensor turb at 1000 for outliers
+         Sensor_Turb = ifelse(Sensor_Turb > 1000, 1000,
+                              ifelse(Sensor_Turb <= 0, 0.01, Sensor_Turb)), # if turb is zero, replace with 0.01 to avoid division by zero
+         log_sensor_turb = log(Sensor_Turb), 
+         Chl_a = ifelse(Chl_a == 0,0.0001, Chl_a),# if Chl_A is zero, replace with 0.001 to avoid division by zero
+         log_chl_a = log(Chl_a),
+           #compute optical bands
+         f_c_turb = FDOM/(Chl_a + Sensor_Turb + FDOM))%>%
+  #remove NAs
+  filter( !is.na(f_c_turb) & !is.na(Temp)& !is.na(Sensor_Cond))#!is.na(hrs_since_last_cleaning) 
+
+# Apply to your new data
+prepped_data_norm <- prepped_data %>%
+  #normalize data based on full sensor set from 01_sensor_data_prep.rmd
+  apply_training_scale(., scaling_params)%>%
+  na.omit()
+```
+
+
+# Run model on sensor data to get TOC estimate
+
+```{r}
+most_recent_file <- list.files("data/upper_clp_dss/modeling/model_splits", pattern = "toc_xgboost_models_light_.*\\.rds", full.names = TRUE) %>%
+  tail(1)
+model <- readRDS(file = most_recent_file)
+```
+
+# Make a plot of historical data model estimated TOC
+
+```{r}
+
+create_toc_model_plot <- function(summary_interval, site_sel,site_title,start_DT,end_DT){
+
+#convert datetimes  
+start_DT <- ymd_hm(start_DT,tz = "MST")
+end_DT <- ymd_hm(end_DT,tz = "MST")
+# Get testing data RMSE for the model
+# find half way point between start and end DT
+halfway_DT <- start_DT + (end_DT - start_DT) / 2
+
+# Summarize data to desired interval and trim to individual site
+sum_data_norm <- prepped_data_norm%>%
+  filter(site == site_sel)%>%
+  select(site, DT_round, all_of(features)) %>%
+  mutate(DT_round = round_date(DT_round, unit = summary_interval )) %>% # ensure DT_round is rounded to the nearest
+  group_by(site, DT_round) %>%
+  summarise(across(everything(), mean, na.rm = TRUE), .groups = 'drop')
+#convert to matrix
+model_input_matrix_sum <- sum_data_norm[, features]%>%
+  mutate(across(everything(), as.numeric)) %>%
+  as.matrix()
+
+# Add predictions from each fold model as new columns
+for (i in seq_along(model)) {
+  fold_model <- model[[i]]
+  col_name <- glue("{target}_guess_fold{i}")
+  sum_data_norm[[col_name]] <- predict(fold_model, model_input_matrix_sum)
+}
+
+fold_cols <- glue("{target}_guess_fold{seq_along(model)}")
+ensemble_col <- glue("{target}_guess_ensemble")
+sum_data_norm[[ensemble_col]] <- rowMeans(sum_data_norm[, fold_cols])
+
+# make min and max toc guess col based on fold guesses
+plot_sensor_data <- sum_data_norm %>%
+  mutate(!!glue("{target}_guess_min") := pmin(!!!syms(fold_cols)),
+         !!glue("{target}_guess_max") := pmax(!!!syms(fold_cols)))%>%
+  mutate(!!glue("{target}_guess_ensemble") := pmax(0, !!sym(glue("{target}_guess_ensemble"))))%>% # remove TOC guesses < 0
+  #filter to desired time window
+  filter(between(DT_round, start_DT , end_DT))
+  
+#Water chem
+plot_water_chem <- water_chem %>%
+  filter(site == site_sel)%>%
+  filter(between(DT_round, start_DT, end_DT))%>%
+  mutate(DT_round = round_date(DT_round, unit = summary_interval )) #round date to match sensor data
+
+#get correct dates for plot title
+start_DT <- min(plot_sensor_data$DT_round, na.rm = TRUE)
+end_DT <- max(plot_sensor_data$DT_round, na.rm = TRUE)
+
+toc_plot <- ggplot() +
+  geom_ribbon(data = plot_sensor_data,
+              aes(x = DT_round,
+                  ymin = TOC_guess_min,
+                  ymax = TOC_guess_max,
+                  fill = "Models Estimate Range"),
+              alpha = 0.5) +
+  # one line per fold_col, each with its own color
+  # map(fold_cols, ~
+  #   geom_path(data = plot_sensor_data,
+  #             aes(x = DT_round,
+  #                 y = .data[[.x]],
+  #                 color = .x),    # <- put fold name in legend
+  #             linewidth = 0.3)
+  # ) +
+  geom_path(data = plot_sensor_data, 
+            aes(x = DT_round,
+                y = .data[[ensemble_col]],
+                color = "Mean Model Estimate"),
+            linewidth = 1) +
+  geom_point(data = plot_water_chem,
+             aes(x = DT_round,
+                 y = TOC,
+                 #shape = collector,
+                 color = "Sample Values")) +
+  labs(title = paste0("Estimated TOC at ", str_to_title(site_title)," from ", as.Date(start_DT), " - ", as.Date(end_DT)),
+       x = "Date",
+       y = "Model Estimated TOC (mg/L)", 
+      # shape = "Sample Collector",
+       fill = "",
+       color = "") +
+  scale_fill_manual(values = c("Models Estimate Range" = "grey")) +
+  scale_color_manual(
+    values = c(
+      #setNames(scales::hue_pal()(length(fold_cols)), fold_cols),  # distinct colors for folds
+      "Mean Model Estimate" = "#E70870",
+      "Sample Values" = "#002EA3"
+    )
+  ) +
+  theme(legend.position = "bottom") +
+  guides(fill = guide_legend(override.aes = list(alpha = 0.5))) +
+  annotate("text", 
+           x = max(plot_sensor_data$DT_round, na.rm = TRUE), 
+           y = Inf, 
+           label = "PRELIMINARY RESULTS", 
+           hjust = 1.1, 
+           vjust = 1.5, 
+           size = 7, 
+           fontface = "bold",
+           color = "red") +
+  ROSS_theme
+
+# combine grabs and sensor data for plotting to determine axes
+plot_toc <- c(plot_sensor_data$TOC_guess_min, plot_sensor_data$TOC_guess_max, plot_water_chem$TOC)
+max_plot_toc <- max(plot_toc, na.rm = TRUE)
+min_plot_toc <- min(plot_toc, na.rm = TRUE)
+
+if(max_plot_toc > max(water_chem$TOC, na.rm = T)){
+  toc_plot <- toc_plot + 
+  geom_hline(yintercept = toc_max, linetype = "dashed", color = "red") +
+  annotate("text", x = halfway_DT, y = toc_max - 0.2, label = "Max TOC Measured")
+}
+
+return(toc_plot)
+
+}
+```
+
+
+# Example 1: Chambers outflow
+
+```{r}
+
+chd_plot <- create_toc_model_plot(summary_interval = "4 hour",
+                                  site_sel = "pfal",
+                                  site_title = "Chambers Lake Outflow",
+                                  start_DT = "2025-04-01 23:59",
+                                  end_DT = "2025-07-05 00:00"
+                              )
+chd_plot
+ggsave("data/upper_clp_dss/figures/toc_chambers_outflow_20250601_20250705.png", 
+       plot = chd_plot, 
+       width = 12, 
+       height = 8, 
+       dpi = 300)
+
+```
+
+# Example 2: PBR
+
+```{r}
+
+pbr_plot1 <-   create_toc_model_plot(summary_interval = "6 hour",
+                                  site_sel = "pbr",
+                                  site_title = "Indian Meadows",
+                                  start_DT = "2025-05-01 23:59",
+                                  end_DT = "2025-07-08 00:00"
+                              )
+pbr_plot1
+
+ggsave("data/upper_clp_dss/figures/toc_pbr_20250501_20250708.png", 
+       plot = pbr_plot1, 
+       width = 12, 
+       height = 8, 
+       dpi = 300)
+
+pbr_plot2 <-  create_toc_model_plot(summary_interval = "4 hour",
+                                  site_sel = "pbr",
+                                  site_title = "Indian Meadows",
+                                  start_DT = "2025-05-20 23:59",
+                                  end_DT = "2025-0-10 00:00"
+                              )
+
+pbr_plot2
+ggsave("data/upper_clp_dss/figures/toc_pbr_20250601_20250630.png", 
+       plot = pbr_plot2, 
+       width = 12, 
+       height = 8, 
+       dpi = 300)
+
+```
+# Example 3: CBRI 2024
+
+```{r}
+
+cbri_plot <- create_toc_model_plot(site_sel = "cbri",
+                                   summary_interval = "4 hours",
+                                  site_title = "Joe Wright Reservoir Outflow",
+                                  start_DT = "2024-04-15 23:59",
+                                  end_DT = "2024-8-01 00:00"
+                              )
+
+cbri_plot
+ggsave("data/upper_clp_dss/figures/toc_cbri_20240415_20240801.png", 
+       plot = cbri_plot, 
+       width = 12, 
+       height = 8, 
+       dpi = 300)
+
+```
+# Example 3: PMAN 2025
+
+```{r}
+
+ pman_plot<- create_toc_model_plot(site_sel = "pman",
+                                   summary_interval = "4 hour",
+                                  site_title = "Poudre at Manner's Bridge",
+                                  start_DT = "2025-04-15 23:59",
+                                  end_DT = "2025-07-05 00:00"
+                              )
+pman_plot
+
+ggsave("data/upper_clp_dss/figures/toc_pman_20250424_20250714.png", 
+       plot = pman_plot, 
+       width = 12, 
+       height = 8, 
+       dpi = 300)
+
+```
+
+# Example 4: PBD 2025
+
+```{r}
+
+pbd_plot<- create_toc_model_plot(site_sel = "pbd",
+                                   summary_interval = "4 hour",
+                                  site_title = "Poudre at Canyon Mouth Gage",
+                                  start_DT = "2025-04-15 23:59",
+                                  end_DT = "2025-07-05 00:00"
+                              )
+
+pbd_plot
+
+ggsave("data/upper_clp_dss/figures/toc_pbd_20250415_20250705.png", 
+       plot = pbd_plot, 
+       width = 12, 
+       height = 8, 
+       dpi = 300)
+```
+
+# Make a plot
+
+```{r}
+
+best_sites <- c("cbri", "pfal", "sfm", "pbd")
+
+#rename the sites in the plot 
+plot_data <- prepped_data_norm%>%
+  filter( year(hourly_round) == 2024 & site %in% best_sites)%>%
+  mutate(site = case_when(site == "cbri" ~ "Chambers Inflow",
+                          site == "pfal" ~ "Below Poudre Falls",
+                          site == "sfm" ~ "South Fork",
+                          site == "pbd" ~ "Canyon Mouth",
+                          TRUE ~ site))
+
+plot_data$site_f <- factor(plot_data$site, levels = c("Chambers Inflow", "Below Poudre Falls", "South Fork", "Canyon Mouth"))
+
+plot_wc <- water_chem%>%
+  filter(year(DT_sample) == 2024 & site_code %in% best_sites)%>%
+  mutate(site = case_when(site_code == "cbri" ~ "Chambers Inflow",
+                          site_code == "pfal" ~ "Below Poudre Falls",
+                          site_code == "sfm" ~ "South Fork",
+                          site_code == "pbd" ~ "Canyon Mouth",
+                          TRUE ~ site_code))
+plot_wc$site_f <- factor(plot_wc$site, levels = c("Chambers Inflow", "Below Poudre Falls", "South Fork", "Canyon Mouth"))
+
+ggplot(plot_data, aes(x = hourly_round))+
+  geom_point( aes(y = doc_guess, color = "Model estimate from sensor data"), size = 2)+
+  geom_point(data = plot_wc, 
+             aes(x = DT_sample, y = DOC, color = "Measured"), size = 2)+
+  facet_wrap( .~site_f)+
+  labs(
+    x = "Date", 
+    y = "Hourly DOC (mg/L)", 
+    color = "")+
+  scale_color_manual(values = c("Model estimate from sensor data" = "#E70870", "Measured" =  "#002EA3"))+
+  theme_few(base_size = 28)+
+  theme(legend.position = "bottom")
+
+#ggsave("images/doc_hourly_ts.png", width = 12, height = 8, units = "in", dpi = 300)
+```
+
+
+
+
+# Daily
+
+```{r}
+
+
+all_sensor_data <- read_rds( "data/sensor/prepped/all_sensor_data.rds")
+
+
+prepped_data <- all_sensor_data%>%
+  select(site, 
+         DT_round, 
+         FDOM = `FDOM Fluorescence`,
+         hrs_since_last_cleaning = hours_since_last_visit,
+         Temp = Temperature,
+         Sensor_Cond = `Specific Conductivity`,
+         Sensor_Turb = Turbidity,
+         Chl_a = `Chl-a Fluorescence`) %>%
+  #Sumarize to daily by site
+  mutate(date = as_date(DT_round, tz = "MST"), 
+         hourly_round = round_date(DT_round, unit = "1 hour" ))%>%
+  group_by(site, date)%>%
+  summarize(across(where(is.numeric), median, na.rm = TRUE))%>%
+  mutate(fc = FDOM/(Chl_a + Sensor_Turb + FDOM))
+
+
+
+prepped_data_norm <- prepped_data %>%
+  mutate(across(where(is.numeric),rescale)) %>%
+  na.omit()
+```
+
+
+# Run model on sensor data to get TOC estimate
+
+```{r}
+
+features <- c('FDOM','hrs_since_last_cleaning', 'Sensor_Turb','Chl_a','Temp','fc')
+
+target <- 'TOC'
+
+prepped_data_matrix <- as.matrix(prepped_data_norm[,features])
+
+prepped_data_norm$toc_guess <- predict(toc_mod, prepped_data_matrix)
+```
+
+# Make a plot
+
+```{r}
+
+best_sites <- c("pbd", "pfal", "sfm", "lincoln")
+#best_sites <- unique(prepped_data_norm$site)
+
+#rename the sites in the plot 
+plot_data <- prepped_data_norm%>%
+  filter( year(date) == 2024 & site %in% best_sites)%>%
+  mutate(site = case_when(site == "cbri" ~ "Chambers Inflow",
+                          site == "pfal" ~ "Poudre River Below Poudre Falls",
+                          site == "sfm" ~ "South Fork of the Poudre River",
+                          site == "pbd" ~ "Poudre River at Greeley Intake",
+                          site == "penn" ~ "Pennock Creek",
+                          site == "lincoln" ~ "Poudre River at Lincoln Ave",
+                          TRUE ~ site))
+
+plot_data$site_f <- factor(plot_data$site, levels = c("Chambers Inflow", "Pennock Creek", "Poudre River Below Poudre Falls", "South Fork of the Poudre River", "Poudre River at Greeley Intake", "Poudre River at Lincoln Ave"))
+
+plot_wc <- water_chem%>%
+  filter(year(DT_sample) == 2024 & site_code %in% best_sites)%>%
+  mutate(site = case_when(site_code == "cbri" ~ "Chambers Inflow",
+                          site_code == "pfal" ~ "Poudre River Below Poudre Falls",
+                          site_code == "sfm" ~ "South Fork of the Poudre River",
+                          site_code == "pbd" ~ "Poudre River at Greeley Intake",
+                          site_code == "penn" ~ "Pennock Creek",
+                          site_code == "lincoln" ~ "Poudre River at Lincoln Ave",
+                          TRUE ~ site_code))
+plot_wc$site_f <- factor(plot_wc$site, levels = c("Chambers Inflow", "Poudre River Below Poudre Falls", "South Fork of the Poudre River", "Poudre River at Greeley Intake", "Poudre River at Lincoln Ave", "Pennock Creek"))
+
+ggplot(plot_data, aes(x = date))+
+  geom_point( aes(y = toc_guess, color = "Model Estimate from Sensor Data"), size = 2)+
+  geom_point(data = plot_wc, 
+             aes(x = Date, y = TOC, color = "Measured"), size = 2)+
+  facet_wrap( .~site_f)+
+  labs(
+    x = "Date", 
+    y = "Daily TOC (mg/L)", 
+    color = "")+
+  scale_color_manual(values = c("Model Estimate from Sensor Data" = "#E70870", "Measured" =  "#002EA3"))+
+  theme_few(base_size = 28)+
+  theme(legend.position = "bottom")
+
+ggsave("images/toc_daily_ts.png", width = 12, height = 8, units = "in", dpi = 300)
+```
+
+

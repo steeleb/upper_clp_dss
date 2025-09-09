@@ -155,7 +155,7 @@ pre_verified_dataset_2024 <- pre_verified_names %>%
   keep_at(imap_lgl(., ~ grepl(parameter_level_string, .y))) 
 
 
-# Combining all 2023 data by preferentially using post verified data
+# Combining all 2024 data by preferentially using post verified data
 ver_names <- intersect(names(verified_dataset_2024), names(pre_verified_dataset_2024))
 non_ver_names <- setdiff(names(pre_verified_dataset_2024), ver_names)
 dataset_2024 <- c(
@@ -247,7 +247,7 @@ final_directory <- "data/manual_data_verification/2025_cycle/hydro_vu_pull/final
 
 # Configure your threshold files
 sensor_thresholds_file <- "data/field_notes/qaqc/sensor_spec_thresholds.yml"
-seasonal_thresholds_file <- "data/field_notes/qaqc/updated_seasonal_thresholds_2025.csv"
+seasonal_thresholds_file <- "data/field_notes/qaqc/updated_seasonal_thresholds_2025_sjs.csv" #updated sensor thresholds with some manual changes for sites with minimal data
 
 # Configure your credentials files
 mwater_creds_file <- "creds/mWaterCreds.yml"
@@ -308,17 +308,19 @@ sensor_malfunction_notes <- grab_mWater_malfunction_notes(mWater_api_data = mWat
 #### Pulling 2025 HV data
 
 ```{r}
-###### ALREADY RUN #######
+###### ALREADY RUN for 07/2025 #######
 # get HydroVu site information
 # hv_sites <- hv_locations_all(hv_token) %>%
 #   filter(!grepl("vulink", name, ignore.case = TRUE))
+
+###### ALREADY RUN for 07/2025 #######
 
 # convert dates to proper timezone
 mst_start <- ymd_hms(start_date, tz = time_zone)
 mst_end <- ymd_hms(end_date, tz = time_zone)
 
 
-###### ALREADY RUN #######
+###### ALREADY RUN for 07/2025 #######
 # source("src/api_puller.R")
 # 
 # # pull data for each site
@@ -336,6 +338,7 @@ mst_end <- ymd_hms(end_date, tz = time_zone)
 #        )
 #      }
 # )
+##### Already RUN for 07/2025 ######
 
 # load all raw data files
 hv_data <- list.files(staging_directory, full.names = TRUE) %>%
@@ -400,7 +403,7 @@ for (chunk_idx in seq_along(summarized_data_chunks)) {
   
   # apply single-parameter flags
   chunk_results <- chunk_data %>%
-    future_map(
+    map(
       function(data) {
         flagged_data <- data %>%
           data.table(.) %>%
@@ -428,7 +431,6 @@ for (chunk_idx in seq_along(summarized_data_chunks)) {
         if (unique(data$parameter) %in% unique(season_thresholds$parameter)) {
           flagged_data <- flagged_data %>%
             data.table(.) %>%
-#TODO: seasonal flags for upper clp sites not generated, Juan will be updating with additional sites shortly and will update existing filepath
             add_seasonal_flag(df = ., threshold_table = season_thresholds)
         }
         
@@ -571,7 +573,13 @@ all_data_2025 <- flagged_2025_dataset %>%
     clean_mean = case_when(
       #verified data
       !is.na(mal_flag)  ~ NA,
-      !is.na(auto_flag) ~ NA,
+      !is.na(auto_flag) & parameter == "FDOM Fluorescence" & auto_flag == "drift" ~ mean, # FDOM over flagged for drift
+      !is.na(auto_flag) & parameter == "FDOM Fluorescence" & auto_flag == "outside of seasonal range" ~ mean, # FDOM over flagged for drift
+            !is.na(auto_flag) & parameter == "Turbidity" & auto_flag == "outside of seasonal range" & mean <= 10 & mean == 0 ~ mean, # Turbidity overflagged for turb at low values, 
+        !is.na(auto_flag) & parameter == "Chl-a Fluorescence" & auto_flag == "outside of seasonal range" & mean <= 2 & site == "sfm" ~ mean, # SFM Chl-a overflagged in spring values
+      !is.na(auto_flag) & auto_flag == "outside of seasonal range" & site == "chd" & parameter != "pH"~ mean, 
+      # CHD overflagged across most parameters except pH
+      
       is.na(auto_flag) & is.na(mal_flag) ~ mean),
     clean_flag = case_when(
       !is.na(mal_flag)  ~ mal_flag,
@@ -595,26 +603,52 @@ all_data_2025 <- flagged_2025_dataset %>%
 
 
 
-# Bind all sensor data
+# Bind all sensor data & create smoothed mean for turb/chl-a
 
 ```{r}
-all_sensor_data <- bind_rows(all_data_2023, all_data_2024, all_data_2025)%>%
-  mutate(hours_since_last_visit = as.numeric(difftime(DT_round, last_site_visit, units = "hours")))%>%
-  dplyr::rename(value = mean)%>%
+source("src/low_pass_filter.R")
+
+all_data_2023_smooth <- all_data_2023 %>%
+  split(f = list(.$site, .$parameter), sep = "-") %>%
+  keep(~nrow(.) > 0) %>%
+  map(~arrange(., DT_round) %>% low_pass_filter(.)) %>%
+  bind_rows()
+
+all_data_2024_smooth <- all_data_2024%>%
+  split(f = list(.$site, .$parameter), sep = "-") %>%
+   keep(~nrow(.) > 0)%>%
+  map(~arrange(., DT_round) %>% low_pass_filter(.)) %>%
+  bind_rows()
+
+all_data_2025_smooth <- all_data_2025%>%
+  split(f = list(.$site, .$parameter), sep = "-") %>%
+   keep(~nrow(.) > 0)%>%
+  map(~arrange(., DT_round) %>% low_pass_filter(.)) %>%
+  bind_rows()
+
+all_sensor_data <- bind_rows(all_data_2023_smooth, all_data_2024_smooth, all_data_2025_smooth)%>%
+  mutate(hours_since_last_visit = as.numeric(difftime(DT_round, last_site_visit, units = "hours")), 
+         value = case_when(
+           !is.na(smoothed_mean) ~ smoothed_mean, 
+           !is.na(mean) ~ mean, 
+           is.na(mean)& is.na(smoothed_mean) ~ NA
+         ))%>%
   filter(!is.na(value))
   
-
+write_parquet(all_sensor_data, "data/upper_clp_dss/sensor/prepped/all_sensor_data_long.parquet")
 ```
 
 # Plot to double check
 ```{r}
-#
-all_sensor_data%>%
-  filter(parameter == "FDOM Fluorescence")%>%
-  filter( site %in% c("pbr","udall", "cottonwood"))%>%
-  ggplot(aes(x = DT_round, y = value, color = flag))+
-  geom_point()+
-  facet_wrap( site ~ parameter, scales = "free_y")+
+ all_sensor_data%>%
+  #filter(parameter == "Turbidity")%>%
+  filter( site %in% c("chd"))%>%
+  filter(year(DT_round) == 2025)%>%
+  ggplot(aes(x = DT_round))+
+  geom_point( aes(y = mean, color = flag))+
+  #geom_line(aes(y = smoothed_mean), color = "blue")+
+  #scale_y_log10()+
+  facet_wrap(  ~parameter, scales = "free_y")+
   theme_minimal()+
   theme(axis.text.x = element_text(angle = 45, hjust = 1))
 
@@ -630,15 +664,12 @@ all_sensor_data_wide <- all_sensor_data%>%
   ungroup()%>%
   pivot_wider(id_cols = c("site", "DT_round", "hours_since_last_visit"), names_from = parameter, values_from = value)%>%
   mutate(across(where(is.list), ~ map_dbl(.x, ~ ifelse(is.null(.), NA, .))))%>%
-  #remove rows when any of the values in the columns other than site and DT_round are NA
-  filter(
-    !is.na(`Chl-a Fluorescence`) & 
+  #remove rows when any of the values in the columns other than site, DT_round, Depth (not yet model parameter) are NA
+  mutate( data_avail = ifelse((!is.na(`Chl-a Fluorescence`) & 
     !is.na(`Specific Conductivity`) & 
     !is.na(`Temperature`) & 
     !is.na(`Turbidity`) & 
-    !is.na(`FDOM Fluorescence`)& 
-    !is.na(Depth))%>%
-  mutate(data_avail = 1)
+    !is.na(`FDOM Fluorescence`)), TRUE, FALSE))
 
 #save applicable data
 
@@ -647,6 +678,8 @@ max_date = format(max(all_sensor_data_wide$DT_round, na.rm = TRUE), "%Y-%m-%d")
 
 write_parquet(all_sensor_data_wide, paste0("data/upper_clp_dss/sensor/prepped/all_sensor_data_",min_date, "_", max_date,".parquet"))
 ```
+
+
 
 
 ## FC Sensor Data
