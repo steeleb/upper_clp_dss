@@ -2,6 +2,13 @@
 
 
 server <- function(input, output, session) {
+  # Call secure_server to check credentials
+  res_auth <- secure_server(
+    check_credentials = check_credentials(
+      db = "credentials.sqlite",
+      passphrase = Sys.getenv("DB_PASSWORD")
+    )
+  )
 
   # Reactive values for storing data
   values <- reactiveValues(
@@ -17,7 +24,11 @@ server <- function(input, output, session) {
                  "Load Data",
                  color = "default",
                  style = "fill",
-                 size = "lg")
+                 size = "lg"),
+      switchInput("apply_qaqc_filter",
+                  "Apply Data QAQC Filters",
+                  value = TRUE,
+                  inline = TRUE)
     )
   })
 
@@ -43,10 +54,11 @@ server <- function(input, output, session) {
       github_link <- "https://github.com/rossyndicate/upper_clp_dss/raw/main/dashboard/data/data_backup.parquet"
       cached_data <- arrow::read_parquet(github_link, as_data_frame = TRUE)
 
-      start_DT <- with_tz(max(cached_data$DT_round), "America/Denver")
+      #Calculate max datetimes in cached dataset by site
+      max_dts <- cached_data%>%
+        summarise(max_DT = max(DT_round, na.rm = TRUE), .by = "site")
 
       end_DT   <- as.POSIXct(paste0(date_range[2], " 23:55"), tz = "America/Denver")
-
 
       #### WET API Pull ####
       #check to see if we need to pull WET data
@@ -60,17 +72,19 @@ server <- function(input, output, session) {
         #report out progress pre pull
         #incProgress(0.2, detail = "Connecting to WET API...")
         incProgress(0.2, detail = "Importing ROSS radio telemetry data...")
-
+        # Determine start date for each site based on cached data
+        site_start_DT <- filter(max_dts, site %in% sites)%>%
+          mutate(max_cached_DT = with_tz(max_DT, "America/Denver"))
         # Code to actually pull in from API
         #Pull in data
-        wet_data <- map(sites,
-                        ~pull_wet_api(
-                          target_site = .x,
-                          start_datetime = start_DT,
-                          end_datetime = end_DT,
-                          data_type = "all",
-                          time_window = "all"
-                        )) %>%
+        wet_data <- map2(site_start_DT$site, site_start_DT$max_cached_DT,
+                         ~pull_wet_api(
+                           target_site = .x,
+                           start_datetime = .y,
+                           end_datetime = end_DT, #always  today at midnight
+                           data_type = "all",
+                           time_window = "all"
+                         )) %>%
           rbindlist()%>%
           filter(value %nin% invalid_values, !is.na(value)) %>%
           split(f = list(.$site, .$parameter), sep = "-")
@@ -99,14 +113,6 @@ server <- function(input, output, session) {
         incProgress(0.4, detail = "Importing to HydroVu Data...")
 
         # Code to actually pull in from API
-        # Set up parallel processing
-        num_workers <- min(availableCores() - 1, 4) # Use at most 4 workers
-        plan(multisession, workers = num_workers)
-        furrr_options(
-          globals = TRUE,
-          packages = c("arrow", "data.table", "httr2", "tidyverse", "lubridate", "zoo",
-                       "padr", "stats", "RcppRoll", "yaml", "here", "fcw.qaqc")
-        )
 
         # # suppress scientific notation to ensure consistent formatting
         options(scipen = 999)
@@ -127,13 +133,15 @@ server <- function(input, output, session) {
           #these should be included in the historical data pull
           filter(!grepl("2024", name, ignore.case = TRUE))
 
+        site_start_DT <- filter(max_dts, site %in% sites)
+
         walk(sites,
              function(site) {
                message("Requesting HV data for: ", site)
                api_puller(
-                 site = site,
+                 site = site_start_DT$site,
                  network = "all",
-                 start_dt = with_tz(start_DT, tzone = "UTC"), # api puller needs UTC dates
+                 start_dt = site_start_DT$max_DT, # api puller needs UTC dates
                  end_dt = with_tz(end_DT, tzone = "UTC"),
                  api_token = hv_token,
                  hv_sites_arg = hv_sites,
@@ -195,9 +203,15 @@ server <- function(input, output, session) {
         username <- as.character(creds["username"])
         password <- as.character(creds["password"])
         login_url <- as.character(creds["login_url"])
+        # Determine start date for contrail sites based on cached data
+        contrail_start_DTs <- filter(max_dts, site %in% sites)%>%
+          mutate(max_cached_DT = with_tz(max_DT, "America/Denver"))
+
+        #get the earliest max date to ensure we get all data)
+        contrail_start_DT <- min(contrail_start_DTs$max_cached_DT)
 
         # Call the downloader function
-        contrail_data <- pull_contrail_api(start_DT, end_DT, username,password, login_url)
+        contrail_data <- pull_contrail_api(contrail_start_DT, end_DT, username,password, login_url)
 
         #Saving to parquet file for faster loading later on
         #arrow::write_parquet(contrail_data, paste0("data/contrail_testing_subset_",as.Date(start_DT),"_",as.Date(end_DT),".parquet"))
@@ -215,7 +229,6 @@ server <- function(input, output, session) {
       incProgress(0.9, detail = "Processing data...")
       # combine all data
       all_data_raw <- c(hv_data, wet_data, contrail_data)
-
 
       # remove stage data
       list_names <- names(all_data_raw)
@@ -254,11 +267,13 @@ server <- function(input, output, session) {
         mutate(auto_flag = NA,
                mal_flag = NA)
 
-      #TODO: Bind with cached data
+
       dashboard_data <- cached_data %>%
-        anti_join(combined_data, by = c("site", "parameter", "DT_round")) %>%
         bind_rows(combined_data) %>%
-        arrange(site, parameter, DT_round)
+        arrange(site, parameter, DT_round) %>%
+        distinct(site, parameter, DT_round, .keep_all = TRUE) %>%
+        ungroup()
+
 
       # Set the loaded data
       incProgress(1, detail = "Data Loaded")
@@ -267,75 +282,65 @@ server <- function(input, output, session) {
     })
   })
 
-  #### Filtered data reactive val ####
-  filtered_data <- eventReactive(input$load_data, {
+  #### Base filtered data reactive ####
+  # Only updates when load_data is pressed
+  base_filtered_data <- eventReactive(input$load_data, {
     req(loaded_data(), input$date_range, input$sites_select, input$parameters_select)
 
     start_DT <- as.POSIXct(paste0(input$date_range[1], " 00:01"), tz = "America/Denver")
-    end_DT <- as.POSIXct(paste0(input$date_range[2], " 23:55"), tz = "America/Denver")
+    end_DT   <- as.POSIXct(paste0(input$date_range[2], " 23:55"), tz = "America/Denver")
 
-    sites_sel <- filter(site_table, site_name %in% input$sites_select )%>%
-      pull(site_code)
+    sites_sel <- filter(site_table, site_name %in% input$sites_select) %>% pull(site_code)
 
-    data <- loaded_data()%>%
-      mutate(DT_round_MT = with_tz(DT_round, tzone = "America/Denver"))%>%
-      filter(between(DT_round_MT, start_DT, end_DT),
-             site %in% sites_sel,
-             parameter %in% input$parameters_select)
-#TODO: filter for sonde deployed/sensor malfunctions for ALL DATA
-
-#TODO: this might change as we learn what operators want, but for now just filtering out ALL flagged data
-    if(input$apply_qaqc_filter){
-      data <- data %>%
-        filter(is.na(auto_flag),
-               is.na(mal_flag))
-    }
-
-    return(data)
-  })
-
-  #### Site Map Output ####
-  #### Get site locations from metadata ####
-  observeEvent(input$sites_select, {
-    sites_sel <- filter(site_table, site_name %in% input$sites_select )%>%
-      pull(site_code)
-    # Sample site locations
-    values$site_locations <- read_csv("metadata/sonde_location_metadata.csv", show_col_types = F) %>%
-      separate(col = "lat_long", into = c("lat", "lon"), sep = ",", convert = TRUE) %>%
-      st_as_sf(coords = c("lon", "lat"), crs = 4326) %>%
-      mutate(site = tolower(Site),
-             site = ifelse(site %in% c("pman", "pbr"), paste0(site, "_fc"), site))%>%
-      filter(site %in% sites_sel)
-  })
-  #### Generate site map ####
-  output$site_map <- renderLeaflet({
-    req(values$site_locations)
-
-    pal <- colorFactor(
-      palette = c("red", "blue", "green", "purple", "orange"),
-      domain = values$site_locations$Project
-    )
-
-    leaflet(values$site_locations) %>%
-      addTiles() %>%
-      addCircleMarkers(
-        radius = 8,
-        color = ~pal(Project),
-        fillOpacity = 0.7,
-        popup = ~paste("Site:", Site, "<br>",
-                       "Project:", Project)
+    loaded_data() %>%
+      mutate(DT_round_MT = with_tz(DT_round, tzone = "America/Denver")) %>%
+      filter(
+        between(DT_round_MT, start_DT, end_DT),
+        site %in% sites_sel,
+        parameter %in% input$parameters_select
       ) %>%
-      addLegend(
-        pal = pal,
-        values = ~Project,
-        title = "Projects",
-        position = "bottomright"
+      mutate(
+        mean = ifelse(!is.na(mal_flag), NA, mean),
+        mean = if_else(units == "m", mean * 3.28084, mean),
+        units = if_else(units == "m", "ft", units)
       )
   })
+#
+ ####  Reactive value to store filtered data ####
+  filtered_data <- reactive({
+    req(base_filtered_data())
+
+    if (isTRUE(input$apply_qaqc_filter)) {
+      #remove flagged data
+      cleaned_data <- apply_cleaning_filters(df = base_filtered_data(), new_value_col = "mean_cleaned")
+      # interpolate missing data (<1 hour)
+      filled_data  <- apply_linear_interpolation_missing_data(df = cleaned_data, value_col = "mean_cleaned", time_col = "DT_round_MT")
+      # apply binomial filter to turbidity and Chl-a
+      smoothed_data <- apply_low_pass_binomial_filter(df = filled_data, value_col = "mean_filled", new_value_col = "mean_smoothed", time_col = "DT_round_MT")
+      # apply timestep median to reduce noise
+      apply_timestep_median(df = smoothed_data, value_col = "mean_smoothed", new_value_col = "mean", timestep = input$data_timestep, time_col = "DT_round_MT")
+    } else {
+      filled_data <- apply_linear_interpolation_missing_data(df = base_filtered_data(), value_col = "mean",new_value_col = "mean_filled",  time_col = "DT_round_MT")
+      #take timestep median
+      apply_timestep_median(df = filled_data, value_col = "mean_filled", new_value_col = "mean", timestep = input$data_timestep, time_col = "DT_round_MT")
+    }
+  })
+
+
+  #
+  #   # 3a. Flag to track if QA/QC is applied
+  #   qaqc_applied <- reactiveVal(FALSE)
+  #
+  #   # 3b. Reset filtered_data to base when "Load Data" is pressed
+  #   observeEvent(input$load_data, {
+  #     filtered_data(base_filtered_data())
+  #     qaqc_applied(FALSE)  # reset QA/QC flag
+  #   })
 
   #### Time Series Plots ####
   #### Log Controls Dynamic UI ####
   output$log_controls <- renderUI({
+    req(filtered_data())
     data <- filtered_data()
     req(nrow(data) > 0)
 
@@ -363,10 +368,14 @@ server <- function(input, output, session) {
       parameter <- input$parameters_select[row]
       plot_id <- paste0("time_series_plot_", row)
 
+      units <- plot_param_table%>%
+        filter(parameter == !!parameter)%>%
+        pull(units)
+
       fluidRow(
         column(
           width = 12,  # Full width for single plot
-          h4(paste("Time Series for", parameter)),
+          h4(paste0("Time Series for ", parameter, " (", units, ")")),
           plotlyOutput(plot_id, height = "400px")
         )
       )
@@ -386,7 +395,6 @@ server <- function(input, output, session) {
       output[[plot_id]] <- renderPlotly({
         # Filter data for this specific parameter
         plot_data <-  filtered_data() %>%
-          filter(!is.na(mean)) %>%
           filter(parameter == !!parameter)%>%
           left_join(site_table, by = c("site" = "site_code" ))
 
@@ -397,6 +405,10 @@ server <- function(input, output, session) {
         # Get parameter bounds from lookup table
         param_bounds <- plot_param_table %>%
           filter(parameter == !!parameter)
+
+        units <- plot_param_table%>%
+          filter(parameter == !!parameter)%>%
+          pull(units)
 
         # Determine y-axis limits
         if(nrow(param_bounds) > 0 && nrow(plot_data) > 0) {
@@ -437,7 +449,7 @@ server <- function(input, output, session) {
           layout(
             xaxis = list(title = "Date"),
             yaxis = list(
-              title = if (use_log) paste("Log10(", parameter, ")") else parameter,
+              title = if (use_log) paste0("Log10(", parameter,"(" ,units, ")", ")") else paste0(parameter," (" ,units, ")"),
               type = if (use_log) "log" else "linear",
               range = if (use_log) c(log10(max(y_min, 0.01)), log10(y_max)) else c(y_min, y_max)
             ),
@@ -450,7 +462,7 @@ server <- function(input, output, session) {
 
   #### TOC model plots ####
   observe({
-    req(input$parameters_select, input$sites_select, input$model_timestep, filtered_data())
+    req(input$parameters_select, input$sites_select, input$data_timestep, filtered_data())
 
     # get site codes for filtering
     sites_sel <- filter(site_table, site_name %in% input$sites_select )%>%
@@ -458,7 +470,7 @@ server <- function(input, output, session) {
 
     # remove FC sonde data
     input_data <- filtered_data() %>%
-      filter(!str_detect( site, "_fc")) #FC sondes will not have correct parameters
+      filter(!str_detect( site, "_fc")) #FC sondes will not have correct parameters so we can omit them entirely
 
     # Define required parameters
     required_params <- c("FDOM Fluorescence", "Temperature", "Specific Conductivity",
@@ -513,49 +525,19 @@ server <- function(input, output, session) {
 
       return(p)
     }
-
-
     # Apply TOC model on relevant data
     toc_plot_data <- apply_toc_model(sensor_data = input_data,
-                                     toc_model_file_path = "metadata/toc_xgboost_models_light_2025-09-05.rds",
+                                     toc_model_file_path = "metadata/toc_xgboost_models_light_2025-09-09.rds",
                                      scaling_params_file_path = "metadata/scaling_parameters_20250820.rds",
                                      #summarizing model input results to user selected timestep (15 min -> 1 day)
-                                     summarize_interval = input$model_timestep) %>%
-      left_join(site_table, by = c("site" = "site_code"))
-
-    binomial_kernel <- function(int_vec) {
-      kernel <- c(1, 4, 6, 4, 1)
-      x <- sum(int_vec * kernel) / 16
-      return(x)
-    }
-
-    toc_plot_data <- toc_plot_data %>%
-      arrange(site, DT_round) %>%
-      group_by(site) %>%
-      # Applying a 1, 4, 6, 4, 1 gaussian filter to smooth dataset. Only in areas where there are 5 data points (non NAs) in a sequence
-
-      mutate(
-        #Identify windows with NAs
-        has_na_window = rollapply(is.na(TOC_guess_ensemble), width = 5,
-                                  FUN = any, fill = TRUE, align = "center"),
-        #Apply smoothing filter only where no NAs in the 5-point window
-        TOC_guess_ensemble_smooth = ifelse(has_na_window | is.na(TOC_guess_ensemble), # Apply filter only where no NAs in the 5-point window
-                                           TOC_guess_ensemble,  # Keep original value if NAs present
-                                           data.table::frollapply(TOC_guess_ensemble, n = 5, FUN = binomial_kernel,
-                                                                  fill = NA, align = "center"))
-      ) %>%
-      select(-has_na_window) %>%  # Remove helper column
-      ungroup()%>%
+                                     summarize_interval = input$data_timestep,
+                                     time_col = "DT_round_MT",
+                                     value_col = "mean") %>%
+      left_join(site_table, by = c("site" = "site_code"))%>%
       mutate(across(contains("TOC_guess"), ~ round(.x, 2)))
-
-    # Create the plotly plot
-
-    if(input$apply_smoothing_filter == T){
-      plot_param <- "TOC_guess_ensemble_smooth"
-    }else{
-      plot_param <- "TOC_guess_ensemble"
-    }
-    #get sites
+    #parameter to plot
+    plot_param <- "TOC_guess_ensemble"
+    # get the list of sites
     site_list <- unique(toc_plot_data$site_name)
 
     # dynamically create plot containers
@@ -570,12 +552,9 @@ server <- function(input, output, session) {
     # render one plot per site
     lapply(site_list, function(site_cd) {
       output[[paste0("toc_plot_", site_cd)]] <- renderPlotly({
-
-
         site_toc_data <- toc_plot_data %>%
           filter(site_name == site_cd)%>%
-          # Build contiguous non-NA segments so ribbons/lines don't bridge gaps
-          dplyr::arrange(DT_round) %>%
+          dplyr::arrange(DT_round_MT) %>%
           dplyr::mutate(
             gap = is.na(TOC_guess_min) | is.na(TOC_guess_max) | is.na(.data[[plot_param]]),
             gid = cumsum(dplyr::lag(gap, default = TRUE) != gap)
@@ -588,7 +567,7 @@ server <- function(input, output, session) {
           left_join(site_table, by = c("site_code"))%>%
           filter(site_name == site_cd & !is.na(TOC))%>%
           mutate(DT_round = with_tz(round_date(DT_sample, unit = "15 minutes"), tzone = "America/Denver"))%>%
-          filter(between(DT_round, min(site_toc_data$DT_round) - days(1), max(site_toc_data$DT_round) + days(1)))
+          filter(between(DT_round, min(site_toc_data$DT_round_MT) - days(1), max(site_toc_data$DT_round_MT) + days(1)))
 
 
         p <- plot_ly() %>%
@@ -623,7 +602,7 @@ server <- function(input, output, session) {
             p <- p %>%
               add_ribbons(
                 data = d,
-                x = ~DT_round,
+                x = ~DT_round_MT,
                 ymin = ~TOC_guess_min,
                 ymax = ~TOC_guess_max,
                 fillcolor = "grey",
@@ -643,7 +622,7 @@ server <- function(input, output, session) {
             p <- p %>%
               add_lines(
                 data = d,
-                x = ~DT_round,
+                x = ~DT_round_MT,
                 y = ~.data[[plot_param]],
                 line = list(color = "#E70870", width = 2),
                 name = "Mean Model Estimate",
@@ -712,19 +691,18 @@ server <- function(input, output, session) {
         #create empty shapes and annotations lists
         shapes_list <- list()
         annotations_list <- list()
-
         # add preliminary text to annotations
-        annotations_list <- append(annotations_list,
-                                   list(
-                                     x = max(site_toc_data$DT_round, na.rm = TRUE),
-                                     y = max(site_toc_data[[plot_param]], na.rm = TRUE),
-                                     text = "PRELIMINARY RESULTS",
-                                     showarrow = FALSE,
-                                     xanchor = "right",
-                                     yanchor = "top",
-                                     font = list(size = 16, color = "black", family = "Arial Black")
-                                   )
-        )
+        # annotations_list <- append(annotations_list,
+        #                            list(
+        #                              x = max(site_toc_data$DT_round_MT, na.rm = TRUE),
+        #                              y = y_max * 0.85,
+        #                              text = "PRELIMINARY RESULTS",
+        #                              showarrow = FALSE,
+        #                              xanchor = "right",
+        #                              yanchor = "top",
+        #                              font = list(size = 16, color = "black", family = "Arial Black")
+        #                            )
+        # )
 
         # Add line/annotation if data is less than lower model bound
         if(y_min <= toc_model_bounds$TOC_lower){
@@ -771,15 +749,56 @@ server <- function(input, output, session) {
         #### Final layout tweaks ####
         p %>%
           layout(
-            title = site_cd,
+            title = paste0("Estimated TOC (mg/L) at: ", site_cd),
             xaxis = list(title = "Date"),
-            yaxis = list(title = "Model Estimated TOC (mg/L)", range = c(y_min, y_max)),
+            yaxis = list(title = "Model Estimated TOC (mg/L)", range = c(y_min - 0.25, y_max+0.25)),
             legend = list(orientation = "h", x = 0.5, xanchor = "center", y = -0.2),
             hovermode = "x unified",
             annotations = annotations_list
           )
       })
     })
+  })
+
+
+  #### Site Map Output ####
+  #### Get site locations from metadata ####
+  observeEvent(input$sites_select, {
+    sites_sel <- filter(site_table, site_name %in% input$sites_select )%>%
+      pull(site_code)
+    # Sample site locations
+    values$site_locations <- read_csv("metadata/sonde_location_metadata.csv", show_col_types = F) %>%
+      separate(col = "lat_long", into = c("lat", "lon"), sep = ",", convert = TRUE) %>%
+      st_as_sf(coords = c("lon", "lat"), crs = 4326) %>%
+      mutate(site = tolower(Site),
+             site = ifelse(site %in% c("pman", "pbr"), paste0(site, "_fc"), site))%>%
+      filter(site %in% sites_sel)%>%
+      left_join(site_table, by = c("site" = "site_code" ))
+  })
+  #### Generate site map ####
+  output$site_map <- renderLeaflet({
+    req(values$site_locations)
+
+    pal <- colorFactor(
+      palette = c("red", "blue", "green", "purple", "orange"),
+      domain = values$site_locations$watershed
+    )
+
+    leaflet(values$site_locations) %>%
+      addTiles() %>%
+      addCircleMarkers(
+        radius = 8,
+        color = ~pal(watershed),
+        fillOpacity = 0.7,
+        popup = ~paste("Site:", site_name, "<br>",
+                       "Watershed:", watershed)
+      ) %>%
+      addLegend(
+        pal = pal,
+        values = ~watershed,
+        title = "Watershed",
+        position = "bottomright"
+      )
   })
 
   #### Flow data Page ####
@@ -980,7 +999,7 @@ server <- function(input, output, session) {
   })
   #plot for three days of data
   # Generate 7-day Q plot
-  output$three_day_q_plot <- renderPlotly({
+  output$seven_day_q_plot <- renderPlotly({
 
 
     data <- flow_sites_data()%>%
