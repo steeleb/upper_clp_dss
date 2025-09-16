@@ -7,3 +7,8 @@
 creds/
 # mac artifacts
 **.DS_Store
+**.Renviron
+**credentials.sqlite
+dashboard/setup/
+dashboard/metadata/
+**data
