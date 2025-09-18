@@ -5,7 +5,7 @@ server <- function(input, output, session) {
   # Call secure_server to check credentials
   res_auth <- secure_server(
     check_credentials = check_credentials(
-      db = "credentials.sqlite",
+      db = "setup/credentials.sqlite",
       passphrase = Sys.getenv("DB_PASSWORD")
     )
   )
@@ -312,30 +312,29 @@ server <- function(input, output, session) {
 
     if (isTRUE(input$apply_qaqc_filter)) {
       #remove flagged data
-      cleaned_data <- apply_cleaning_filters(df = base_filtered_data(), new_value_col = "mean_cleaned")
-      # interpolate missing data (<1 hour)
-      filled_data  <- apply_linear_interpolation_missing_data(df = cleaned_data, value_col = "mean_cleaned", time_col = "DT_round_MT")
-      # apply binomial filter to turbidity and Chl-a
-      smoothed_data <- apply_low_pass_binomial_filter(df = filled_data, value_col = "mean_filled", new_value_col = "mean_smoothed", time_col = "DT_round_MT")
-      # apply timestep median to reduce noise
-      apply_timestep_median(df = smoothed_data, value_col = "mean_smoothed", new_value_col = "mean", timestep = input$data_timestep, time_col = "DT_round_MT")
+      apply_cleaning_filters(df = base_filtered_data(), new_value_col = "mean_cleaned")%>%
+        # interpolate missing data (<1 hour)
+        apply_interpolation_missing_data(df = .,  value_col = "mean_cleaned", dt_col = "DT_round_MT", method = "spline", max_gap = 4 )%>%
+        # apply binomial filter to turbidity and Chl-a
+        apply_low_pass_binomial_filter(df = .,  value_col = "mean_filled", new_value_col = "mean_smoothed", dt_col = "DT_round_MT")%>%
+        # apply timestep median to reduce noise
+        apply_timestep_median(df = ., value_col = "mean_smoothed", new_value_col = "timestep_median", timestep = input$data_timestep, dt_col = "DT_round_MT")%>%
+        #trim down dataset and rename columns
+        select(DT_round_MT = DT_group, site, parameter, mean = timestep_median)%>%
+        #remove duplicates
+        distinct(site, parameter, mean, DT_round_MT, .keep_all = TRUE)
+
     } else {
-      filled_data <- apply_linear_interpolation_missing_data(df = base_filtered_data(), value_col = "mean",new_value_col = "mean_filled",  time_col = "DT_round_MT")
-      #take timestep median
-      apply_timestep_median(df = filled_data, value_col = "mean_filled", new_value_col = "mean", timestep = input$data_timestep, time_col = "DT_round_MT")
+      # If QA/QC filter is not applied, just return base filtered data with timestep median applied
+      apply_interpolation_missing_data(df = base_filtered_data(),  value_col = "mean", dt_col = "DT_round_MT", method = "spline", max_gap = 4)%>%
+        #take timestep median
+        apply_timestep_median(df = ., value_col = "mean_filled", new_value_col = "timestep_median", timestep = input$data_timestep, dt_col = "DT_round_MT")%>%
+        #trim down dataset and rename columns
+        select(DT_round_MT = DT_group, site, parameter, mean = timestep_median)%>%
+        #remove duplicates
+        distinct(site, parameter, mean, DT_round_MT, .keep_all = TRUE)
     }
   })
-
-
-  #
-  #   # 3a. Flag to track if QA/QC is applied
-  #   qaqc_applied <- reactiveVal(FALSE)
-  #
-  #   # 3b. Reset filtered_data to base when "Load Data" is pressed
-  #   observeEvent(input$load_data, {
-  #     filtered_data(base_filtered_data())
-  #     qaqc_applied(FALSE)  # reset QA/QC flag
-  #   })
 
   #### Time Series Plots ####
   #### Log Controls Dynamic UI ####
