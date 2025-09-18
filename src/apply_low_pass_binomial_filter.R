@@ -20,13 +20,9 @@
 #'
 #' @param df A data frame containing water quality measurements. Must include columns for site, datetime,  parameter, value
 #'
-#' @param data_format The format of the input data. Options are either "dataframe" or "list"
-#' If dataframe is selected, all data (multiple site-parameter combinations) are stored in a single long dataframe.
-#' If list is selected, data are stored in a list of dataframes, with each dataframe containing data for a single site-parameter combination
-#' Default is "dataframe".
 #' @param site_col The name of the column containing site identifiers. Default is "site".
 #' @param parameter_col The name of the column containing parameter identifiers. Default is "parameter".
-#' @param time_col The name of the column containing datetime information. Must be a `POSIXct` or numeric type, or otherwise convertible to numeric. Default is "DT_round".
+#' @param dt_col The name of the column containing datetime information. Must be a `POSIXct` or numeric type, or otherwise convertible to numeric. Default is "DT_round".
 #' @param value_col The name of the column containing the values to be smoothed. Default is "mean".
 #' @param new_value_col The name of the new column to store smoothed values. Default is "smoothed_mean".
 #'
@@ -42,32 +38,22 @@
 #'  data_format = "dataframe",
 #'  site_col = "site",
 #'  parameter_col = "parameter",
-#'  time_col = "DT_round",
+#'  dt_col = "DT_round",
 #'  value_col = "mean",
 #'  new_value_col = "smoothed_mean"
 #'  )
 #'
 #'  # For list format
-#'  result_list <- apply_low_pass_binomial_filter(
-#'  data = your_sensor_data_list,
-#'  data_format = "list")
+#'  result_lists <-all_data_lists%>%
+#'  map(., apply_low_pass_binomial_filter())
 
 apply_low_pass_binomial_filter <- function(df,
-                                          data_format = "dataframe",
-                            site_col = "site",
-                            parameter_col = "parameter",
-                            time_col = "DT_round",
-                            value_col = "mean",
-                            new_value_col = "smoothed_mean") {
+                                           site_col = "site",
+                                           parameter_col = "parameter",
+                                           dt_col = "DT_round",
+                                           value_col = "mean",
+                                           new_value_col = "smoothed_mean") {
 
-  # Function to add column if it doesn't exist
-  add_column_if_not_exists <- function(df, column_name, default_value = NA) {
-
-    if (!column_name %in% colnames(df)) {
-      df <- df %>% dplyr::mutate(!!sym(column_name) := default_value)
-    }
-    return(df)
-  }
 
   # 5-point binomial kernel [1,4,6,4,1]
   binomial_kernel <- function(int_vec) {
@@ -75,100 +61,52 @@ apply_low_pass_binomial_filter <- function(df,
     sum(int_vec * kernel) / 16
   }
 
-  if(data_format == "dataframe"){
-    data_smoothed <- df %>%
-      arrange(!!sym(site_col), !!sym(parameter_col), !!sym(time_col)) %>%
-      group_split(!!sym(site_col), !!sym(parameter_col)) %>%   # split into list of dfs
-      purrr::map(~ {
-        .x <- add_column_if_not_exists(.x, new_value_col)
+  data_smoothed <- df %>%
+    arrange(!!sym(site_col), !!sym(parameter_col), !!sym(dt_col)) %>%
+    group_split(!!sym(site_col), !!sym(parameter_col)) %>%   # split into list of dfs
+    purrr::map(~ {
+      .x <- add_column_if_not_exists(.x, new_value_col)
 
-        this_param <- dplyr::first(.x[[parameter_col]])
+      this_param <- dplyr::first(.x[[parameter_col]])
 
-        if (!is.na(this_param) && this_param %in% c("Turbidity", "Chl-a Fluorescence")) {
-          .x <- .x %>%
-            mutate(
-              # First pass
-              !!sym(new_value_col) := data.table::frollapply(
-                !!sym(value_col), n = 5, FUN = binomial_kernel,
-                fill = NA, align = "center"
-              ),
-              # Second pass
-              !!sym(new_value_col) := data.table::frollapply(
-                !!sym(new_value_col), n = 5, FUN = binomial_kernel,
-                fill = NA, align = "center"
-              ),
-              # Third pass
-              !!sym(new_value_col) := data.table::frollapply(
-                !!sym(new_value_col), n = 5, FUN = binomial_kernel,
-                fill = NA, align = "center"
-              )
-            )
-        } else {
-          .x <- .x %>%
-            mutate(!!sym(new_value_col) := NA_real_)
-        }
-        # Fill remaining NA in smoothed column with original values
+      if (!is.na(this_param) && this_param %in% c("Turbidity", "Chl-a Fluorescence")) {
         .x <- .x %>%
           mutate(
-            !!sym(new_value_col) := if_else(
-              is.na(!!sym(new_value_col)) & !is.na(!!sym(value_col)),
-              !!sym(value_col),
-              !!sym(new_value_col)
+            # First pass
+            !!sym(new_value_col) := data.table::frollapply(
+              !!sym(value_col), n = 5, FUN = binomial_kernel,
+              fill = NA, align = "center"
+            ),
+            # Second pass
+            !!sym(new_value_col) := data.table::frollapply(
+              !!sym(new_value_col), n = 5, FUN = binomial_kernel,
+              fill = NA, align = "center"
+            ),
+            # Third pass
+            !!sym(new_value_col) := data.table::frollapply(
+              !!sym(new_value_col), n = 5, FUN = binomial_kernel,
+              fill = NA, align = "center"
             )
           )
-        return(.x)
-      }) %>%
-      dplyr::bind_rows()   # put the list back together
-
-    return(data_smoothed)
-  }else if(data_format == "list"){
-
-    data_smoothed <- df %>%
-      purrr::map(~ {
-        .x <- add_column_if_not_exists(.x, new_value_col)
-        #Assumes that list only has single parameter per dataframe
-        this_param <- dplyr::first(.x[[parameter_col]])
-
-        if (!is.na(this_param) && this_param %in% c("Turbidity", "Chl-a Fluorescence")) {
-          .x <- .x %>%
-            arrange(!!sym(time_col)) %>%
-            mutate(
-              # First pass
-              !!sym(new_value_col) := data.table::frollapply(
-                !!sym(value_col), n = 5, FUN = binomial_kernel,
-                fill = NA, align = "center"
-              ),
-              # Second pass
-              !!sym(new_value_col) := data.table::frollapply(
-                !!sym(new_value_col), n = 5, FUN = binomial_kernel,
-                fill = NA, align = "center"
-              ),
-              # Third pass
-              !!sym(new_value_col) := data.table::frollapply(
-                !!sym(new_value_col), n = 5, FUN = binomial_kernel,
-                fill = NA, align = "center"
-              )
-            )
-        } else {
-          .x <- .x %>%
-            mutate(!!sym(new_value_col) := NA_real_)
-        }
-        # Fill remaining NA in smoothed column with original values
+      } else {
         .x <- .x %>%
-          mutate(
-            !!sym(new_value_col) := if_else(
-              is.na(!!sym(new_value_col)) & !is.na(!!sym(value_col)),
-              !!sym(value_col),
-              !!sym(new_value_col)
-            )
+          mutate(!!sym(new_value_col) := NA_real_)
+      }
+      # Fill remaining NA in smoothed column with original values
+      .x <- .x %>%
+        mutate(
+          !!sym(new_value_col) := if_else(
+            is.na(!!sym(new_value_col)) & !is.na(!!sym(value_col)),
+            !!sym(value_col),
+            !!sym(new_value_col)
           )
-        return(.x)
-      })
+        )
+      return(.x)
+    }) %>%
+    dplyr::bind_rows()   # put the list back together
 
-    return(data_smoothed)
-  } else {
-    stop("Invalid data_format. Choose either 'dataframe' or 'list'.")
-  }
+  return(data_smoothed)
+
 
 }
 
