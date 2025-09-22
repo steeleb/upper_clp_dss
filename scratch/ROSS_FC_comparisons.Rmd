@@ -23,6 +23,20 @@ all_data_raw <- read_parquet("data/upper_clp_dss/sensor/uclp_sensor_raw_2025-03-
 
 ```
 
+## Load in sample data
+
+```{r}
+
+  
+  water_chem <- read_parquet("data/upper_clp_dss/modeling/ROSS_FC_water_chemistry.parquet")%>%
+  mutate(DT_round_MT = with_tz(round_date(DT_sample, unit = "1 hour" ), tz = "America/Denver"))%>%
+  rename(site = site_code)%>%
+  select(site, DT_round_MT, ChlA, SC, lab_turb)
+
+#toc_max <- max(water_chem$TOC, na.rm = T)
+
+```
+
 # Comparison Plots
 
 ```{r}
@@ -35,15 +49,23 @@ subset <- all_data_raw %>%
 parameters = unique(subset$parameter)
 plot_list <- list()
 
+
+units_table <- data.frame(parameter = c("Turbidity", "pH", "ChlA", "Specific Conductivity", "DO", "Temperature"),
+                            units = c("NTU", "pH", "RFU", "uS/cm", "mg/L", "C"), 
+                          param_w_units = c("Turbidity (NTU)", "pH", "ChlA (RFU)", "Specific Conductivity (uS/cm)", "DO (mg/L)", "Temperature ( C )"))
+
 for(param in parameters){
   
-#TODO: add in grab samples as "truth" for SC, Turb, pH and chla (may want to normalize chla before hand)
+  param_units <- units_table$param_w_units[units_table$parameter == param]
   
   data_plot <- ggplot(subset%>%filter(parameter == param), aes(x = DT_round_MT, y = mean, color = site)) +
         geom_line()+
-        labs(title = paste("Comparison of PBR ROSS and PBR FC", param),
+    #TODO: add in grab samples as "truth" for SC, Turb, pH and chla (may want to normalize chla before hand)
+         # geom_point(data = plot_water_chem,
+         #     aes(x = DT_round, y = TOC, shape = collector, color = "Sample Values")) +
+        labs(
              x = "Date",
-             y = param, 
+             y = param_units, 
              color = "Site")+
     scale_color_manual(values = ROSS_lt_pal)+
     ROSS_theme
@@ -62,8 +84,9 @@ for(param in parameters){
   comp_plot_abs <- ggplot(comp_data%>%filter(parameter == param), aes(x = DT_round_MT, y = difference, color = cat)) +
     geom_point() +
     geom_hline(yintercept = 0, linetype = "solid", color = "black") +
-    labs(x = "", 
-         y = paste0("Absolute Difference for ", param), 
+    labs(title = paste("Comparison of PBR ROSS and PBR FC", param),
+         x = "", 
+         y = paste0("Absolute Difference for ", param_units), 
          color = "Difference Category") +
     scale_color_manual(values = ROSS_acc_pal)+
     ROSS_theme
@@ -78,7 +101,7 @@ for(param in parameters){
     ROSS_theme
       
   plot_list[[param]] <- data_plot+ comp_plot_abs+ comp_plot_perc +
-                                   plot_layout(ncol = 1, nrow = 3, 
+                                   plot_layout(ncol = 3, nrow = 1, 
                                     guides = "collect")
   
   
@@ -86,4 +109,18 @@ for(param in parameters){
 
 print(plot_list)
       
+
+ggsave("data/upper_clp_dss/figures/ROSS_FC_turb_comparison.png", 
+       plot = plot_list$Turbidity,
+       width = 10, height = 6, units = "in", dpi = 300)
+ggsave("data/upper_clp_dss/figures/ROSS_FC_temp_comparison.png", 
+       plot = plot_list$Temperature,
+       width = 10, height = 6, units = "in", dpi = 300)
+ggsave("data/upper_clp_dss/figures/ROSS_FC_ph_comparison.png", 
+       plot = plot_list$pH,
+       width = 10, height = 6, units = "in", dpi = 300)
+
+ggsave("data/upper_clp_dss/figures/ROSS_FC_sc_comparison.png", 
+       plot = plot_list$`Specific Conductivity`,
+       width = 10, height = 6, units = "in", dpi = 300)
 ```
