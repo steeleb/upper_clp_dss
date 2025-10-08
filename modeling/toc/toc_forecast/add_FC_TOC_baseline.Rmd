@@ -1,6 +1,6 @@
 ---
 title: "Baseline TOC model development in CLP"
-date: "2025-10-01"
+date: "2025-10-08"
 output: html_document
 ---
 
@@ -474,7 +474,9 @@ ggplot(test_2025, aes(x = toc_doc, y = pred_avg)) +
            label = metrics_text, size = 4) +
   theme_bw(base_size = 14) 
 
-ggsave()
+# uncomment on new model
+# ggsave(here(paste0("modeling/toc/toc_forecast/performance/baseline_wFC_2025_v", version_date, ".jpg")),
+#        width = 8, height = 8, units = "in")
 
 # for kicks, look at performance by site
 ggplot(test_2025, aes(x = toc_doc, y = pred_avg)) +
@@ -494,8 +496,7 @@ for forecasting:
 
 ```{r}
 test_2025_four <- test_2025 %>% 
-  filter(site_code %in% c("PFAL", "PBR", "PMAN", "PBD"),
-         !(collector == "FC"))
+  filter(site_code %in% c("PFAL", "PBR", "PMAN", "PBD"))
 # calculate performance metrics
 mae_val  <- mae(test_2025_four$toc_doc, test_2025_four$pred_avg)
 rmse_val <- rmse(test_2025_four$toc_doc, test_2025_four$pred_avg)
@@ -526,6 +527,10 @@ ggplot(test_2025_four, aes(x = toc_doc, y = pred_avg, color = collector)) +
   theme_bw(base_size = 14) +
   coord_cartesian(xlim = c(3, 8), ylim = c(3, 8))
 
+# uncomment on new model
+# ggsave(here(paste0("modeling/toc/toc_forecast/performance/baseline_wFC_focus_sites_2025_v", version_date, ".jpg")),
+#        width = 8, height = 8, units = "in")
+
 # for kicks, look at performance by site
 ggplot(test_2025_four, aes(x = DOC, y = pred_avg)) +
   geom_point(color = "blue", alpha = 0.6, size = 2) +
@@ -538,6 +543,49 @@ ggplot(test_2025_four, aes(x = DOC, y = pred_avg)) +
   facet_wrap(site_code ~ .)
 
 ```
+
+And because we think there is something funky with FC data in 2025, we'll also
+do some performance without those data
+
+```{r}
+test_2025_four <- test_2025 %>% 
+  filter(site_code %in% c("PFAL", "PBR", "PMAN", "PBD"),
+         collector != "FC")
+# calculate performance metrics
+mae_val  <- mae(test_2025_four$toc_doc, test_2025_four$pred_avg)
+rmse_val <- rmse(test_2025_four$toc_doc, test_2025_four$pred_avg)
+bias_val <- bias(test_2025_four$toc_doc, test_2025_four$pred_avg)
+
+# r2 from linear regression
+r2_val <- summary(lm(test_2025_four$toc_doc ~test_2025_four$pred_avg))$r.squared
+
+# format annotation text for plot
+metrics_text <- paste0(
+  "MAE = ", round(mae_val, 2),
+  "\nRMSE = ", round(rmse_val, 2),
+  "\nBias = ", round(bias_val, 2),
+  "\nR² = ", round(r2_val, 2)
+)
+
+
+# pred - obs scatter plot!
+ggplot(test_2025_four, aes(x = toc_doc, y = pred_avg, color = collector)) +
+  geom_point(alpha = 0.6, size = 2) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  labs(x = "Observed TOC (mg/L)",
+       y = "Predicted TOC (ensemble, mg/L)",
+       title = "GAM Ensemble Predictions vs Observed (2025)") +
+  annotate("text", x = 3, y = 8, 
+           hjust = 0, vjust = 1, 
+           label = metrics_text, size = 4) +
+  theme_bw(base_size = 14) +
+  coord_cartesian(xlim = c(3, 8), ylim = c(3, 8))
+
+# uncomment on new model
+# ggsave(here(paste0("modeling/toc/toc_forecast/performance/baseline_noFC_focus_sites_2025_v", version_date, ".jpg")),
+#        width = 8, height = 8, units = "in")
+```
+
 
 # Visualize the decision space for interpretability
 
@@ -575,22 +623,46 @@ ggplot(newdata, aes(x = DOY, y = distance_upstream_km, fill = ave_fit)) +
     y = "Distance upstream from Canyon Mouth (km)") +
   theme_bw(base_size = 14) 
 
+# uncomment on new model
+# ggsave(here(paste0("modeling/toc/toc_forecast/performance/baseline_wFC_visualize_model_v", version_date, ".jpg")),
+#        width = 8, height = 8, units = "in")
+
 ```
 
 
 ## Export Models and Metrics
 
 And let's save these models as the baseline and export the performance info for 
-the CV and test sets.
+the CV and test sets. Only run this section if you want to save the models and
+export statistics.
 
 ```{r}
 
-write_rds(cv_1[[1]], here(paste0("data/upper_clp_dss/modeling/TOC_baseline/TOC_GAM_fit1_v", version_date, ".rds")))
-write_rds(cv_2[[1]], here(paste0("data/upper_clp_dss/modeling/TOC_baseline/TOC_GAM_fit2_v", version_date, ".rds")))
-write_rds(cv_3[[1]], here(paste0("data/upper_clp_dss/modeling/TOC_baseline/TOC_GAM_fit3_v", version_date, ".rds")))
-write_rds(cv_4[[1]], here(paste0("data/upper_clp_dss/modeling/TOC_baseline/TOC_GAM_fit4_v", version_date, ".rds")))
-write_rds(cv_5[[1]], here(paste0("data/upper_clp_dss/modeling/TOC_baseline/TOC_GAM_fit5_v", version_date, ".rds")))
-write_rds(cv_6[[1]], here(paste0("data/upper_clp_dss/modeling/TOC_baseline/TOC_GAM_fit6_v", version_date, ".rds")))
+# write_rds(cv_1[[1]], here(paste0("data/upper_clp_dss/modeling/TOC_baseline/TOC_GAM_fit1_v", version_date, ".rds")))
+# write_rds(cv_2[[1]], here(paste0("data/upper_clp_dss/modeling/TOC_baseline/TOC_GAM_fit2_v", version_date, ".rds")))
+# write_rds(cv_3[[1]], here(paste0("data/upper_clp_dss/modeling/TOC_baseline/TOC_GAM_fit3_v", version_date, ".rds")))
+# write_rds(cv_4[[1]], here(paste0("data/upper_clp_dss/modeling/TOC_baseline/TOC_GAM_fit4_v", version_date, ".rds")))
+# write_rds(cv_5[[1]], here(paste0("data/upper_clp_dss/modeling/TOC_baseline/TOC_GAM_fit5_v", version_date, ".rds")))
+# write_rds(cv_6[[1]], here(paste0("data/upper_clp_dss/modeling/TOC_baseline/TOC_GAM_fit6_v", version_date, ".rds")))
+# 
+# ggsave(plot = cv_1[[2]], 
+#        filename = here(paste0("modeling/toc/toc_forecast/performance/cv_1_performance_v", version_date, ".jpg")),
+#        width = 8, height = 8, units = "in")
+# ggsave(plot = cv_2[[2]], 
+#        filename = here(paste0("modeling/toc/toc_forecast/performance/cv_2_performance_v", version_date, ".jpg")),
+#        width = 8, height = 8, units = "in")
+# ggsave(plot = cv_3[[2]],
+#        filename = here(paste0("modeling/toc/toc_forecast/performance/cv_3_performance_v", version_date, ".jpg")),
+#        width = 8, height = 8, units = "in")
+# ggsave(plot = cv_4[[2]],
+#        filename = here(paste0("modeling/toc/toc_forecast/performance/cv_4_performance_v", version_date, ".jpg")),
+#        width = 8, height = 8, units = "in")
+# ggsave(plot = cv_5[[2]],
+#        filename = here(paste0("modeling/toc/toc_forecast/performance/cv_5_performance_v", version_date, ".jpg")),
+#        width = 8, height = 8, units = "in")
+# ggsave(plot = cv_6[[2]],
+#        filename = here(paste0("modeling/toc/toc_forecast/performance/cv_6_performance_v", version_date, ".jpg")),
+#        width = 8, height = 8, units = "in")
 
 ```
 
