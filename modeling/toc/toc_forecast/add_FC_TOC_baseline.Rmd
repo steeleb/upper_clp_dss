@@ -187,7 +187,8 @@ post-fire data, since it doesn't seem significantly larger or smaller than pre-f
 We're assuming that these water years were pretty similar in this assessment.
 
 For now, we're going to limit even further to a handful of sites with good data
-records.
+records. The sites here are those that are on the mainstem and not as affected by
+reservoir signals. In particular, we drop JWC since it is primarily reservoir fed.
 
 ```{r}
 toc %>% 
