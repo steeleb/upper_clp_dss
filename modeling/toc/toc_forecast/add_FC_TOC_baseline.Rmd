@@ -147,7 +147,7 @@ sites, DOC = TOC.
 toc %>% 
   filter(!is.na(TOC) & !is.na(DOC) & 
            (grepl("Upper", Campaign) | Campaign == "South Fork")) %>% 
-  ggplot(., aes(x = TOC, y = DOC, color = year(date))) + geom_point() + 
+  ggplot(., aes(x = TOC, y = DOC, color = factor(year(date)))) + geom_point() + 
   facet_wrap(site_name + location_type ~ .)
 ```
 
@@ -158,7 +158,7 @@ toc %>%
   filter(!is.na(DOC)) %>% 
   filter(grepl("Upper", Campaign) | Campaign == "South Fork") %>% 
   mutate(dist_name = paste(distance_upstream_km, site_name, sep = " - ")) %>% 
-  ggplot(., aes(x = yday(date), y = DOC, color = year(date))) + 
+  ggplot(., aes(x = yday(date), y = DOC, color = factor(year(date)))) + 
   geom_point() + 
   facet_wrap(dist_name + location_type ~.)
 ```
@@ -203,7 +203,7 @@ toc %>%
                                                      "Poudre South Fork",
                                                      "Poudre below Poudre Falls",
                                                      "Poudre Above Joe Wright"))) %>% 
-  ggplot(., aes(x = yday(date), y = DOC, color = year(date))) + 
+  ggplot(., aes(x = yday(date), y = DOC, color = factor(year(date)))) + 
   geom_point() + 
   facet_wrap(ordered_name + distance_upstream_km +location_type + Campaign ~ .)
 
