@@ -2,9 +2,15 @@
 .Rhistory
 .RData
 .Ruserdata
+
 # Only ignore data folder in the project root
 /data/
 creds/
+!data/upper_clp_dss/modeling/TOC_baseline
+
+# Ignore baseline TOC with Q for now (B's copy)
+scratch/baseline_TOC_addQ.rmd
+
 # mac artifacts
 **.DS_Store
 **.Renviron
