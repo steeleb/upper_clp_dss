@@ -1,0 +1,83 @@
+---
+title: "extract_MODIS_snow_data"
+output: html_document
+---
+
+The purpose of this markdown is to grab MODIS snow cover data using the rgee
+package and summarize it for each catchment (defined by locations of monitored 
+discharge). Catchments will be defined using nhdplusTools.
+
+```{r}
+library(rgee)
+library(sf)
+library(nhdplusTools)
+library(tidyverse)
+
+# needs pySetup see Aquasat:
+# https://github.com/AquaSat/AquaMatch_lakeSR/blob/main/python/pySetup.R
+
+# see also rgee setup instructions:
+# https://cran.r-project.org/web/packages/rgee/vignettes/rgee01.html#6_Installation
+
+# Initialize Earth Engine
+ee_Initialize()
+```
+
+# Example: load your AOI (replace with your sf object)
+aoi <- st_read("path/to/your_area.shp") %>% sf_as_ee()
+
+```{r}
+# need to think about how to grab the right-sized catchment upstream of Q
+get_huc()
+
+```
+
+
+
+# MODIS MOD10A1 (Terra) and MYD10A1 (Aqua)
+mod10 <- ee$ImageCollection("MODIS/061/MOD10A1")
+myd10 <- ee$ImageCollection("MODIS/061/MYD10A1")
+
+# Combine collections and select the "NDSI_Snow_Cover" band
+modis_snow <- mod10$merge(myd10)$select("NDSI_Snow_Cover")
+
+# Define time range
+start_date <- "2023-11-01"
+end_date <- "2024-04-30"
+
+modis_filtered <- modis_snow$
+  filterDate(start_date, end_date)$
+  map(function(img) {
+    img$clip(aoi)$
+      updateMask(img$gte(0))$  # remove fill values 
+      set("date", img$date()$format("YYYY-MM-dd"))
+  })
+
+# Compute proportion of snow cover for each image
+get_prop_snow <- function(img) {
+  total_pixels <- img$reduceRegion(
+    reducer = ee$Reducer$count(),
+    geometry = aoi,
+    scale = 500 # this must match the resolution of the RS product
+  )$getNumber("NDSI_Snow_Cover")
+
+  snow_pixels <- img$gt(0)$reduceRegion( # this probably needs a higher threshold than 0
+    reducer = ee$Reducer$count(),
+    geometry = aoi,
+    scale = 500
+  )$getNumber("NDSI_Snow_Cover")
+
+  prop <- snow_pixels$divide(total_pixels)
+  
+  img$set("n_pixels", total_pixels)
+  img$set("n_snow_pixels", snow_pixels)
+  img$set("snow_cover_fraction", prop)
+}
+
+snow_summary <- modis_filtered$map(get_prop_snow)
+
+# Extract to R
+snow_df <- ee_as_dataframe(
+  snow_summary,
+  columns = c("date", "n_pixels", "n_snow_pixels", "snow_cover_fraction") # probably also need to know which mission (Aqua/Terra) it's from here
+)
