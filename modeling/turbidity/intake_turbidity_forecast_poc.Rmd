@@ -1,0 +1,829 @@
+---
+title: "Intake Turbidity Forecast — Hierarchical GAM Proof of Concept"
+author: "ROSSyndicate"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+
+library(here)
+library(cdssr)
+library(snotelr)
+library(mgcv)
+library(Metrics)
+library(RcppRoll)
+library(tidyverse)
+```
+
+# Purpose
+
+Proof-of-concept for predicting **next-day (t+1) p95 turbidity at the FC intake**
+using a hierarchical GAM structure. Given the low sample size and the two dominant
+turbidity regimes — spring snowmelt and convective storms — a single global model
+is likely to underfit high-turbidity events. Instead, we classify each day into one
+of three regimes and fit a lightweight GAM per regime:
+
+| Regime | Drivers | GAM predictors |
+|---|---|---|
+| **Snowmelt** | DOY 60–180, active melt | DOY, log(Q), melt rate |
+| **Convective** | Precip event (any season) | log(Q), ΔQ₂₄ₕ, precip features |
+| **Baseflow** | Everything else | DOY, log(Q) |
+
+All three are compared against a **global GAM** and a **persistence baseline**
+(today's p95 as tomorrow's forecast) via 5-fold year-grouped cross-validation on
+2010–2023. 2024–2025 is held out entirely as the test set.
+
+All GAMs use `family = Gamma(link = "log")`, which is appropriate for strictly
+positive, right-skewed turbidity data and does not require a manual log transform.
+
+---
+
+# Setup
+
+```{r constants}
+# ── Regime classification thresholds ─────────────────────────────────────────
+PRECIP_THRESH          <- 0.4   # inches: binary event indicator
+CONVECTIVE_PRECIP_THRESH <- 1  # inches over 3 days: antecedent wetness
+MELT_THRESH            <- 0     # melt_rate_7d > this → active snowmelt
+
+# ── Evaluation ────────────────────────────────────────────────────────────────
+HIGH_TURB_THRESH       <- 75    # NTU: threshold for high-turbidity event evaluation
+
+# ── Train / test split ────────────────────────────────────────────────────────
+TEST_YEARS     <- 2024:2025
+TRAIN_CV_YEARS <- 2010:2023
+
+# 5 grouped-year CV folds: each fold's years are held out as validation;
+# all other TRAIN_CV_YEARS are used as training. Adjust groupings as needed.
+cv_folds <- list(
+  fold_1 = 2010:2012,
+  fold_2 = 2013:2015,
+  fold_3 = 2016:2018,
+  fold_4 = 2019:2020,
+  fold_5 = 2021:2023
+)
+
+# ── GAM formulas ──────────────────────────────────────────────────────────────
+# Global model: all predictors, all data
+GLOBAL_FORMULA <- target_p95 ~
+  s(doy, bs = "cc", k = 10) +
+  s(log_q, k = 10) +
+  s(deltaQ_24h, k = 10) +
+  precip_3day +
+  precip_event +
+  s(melt_rate_7d, bs = "ts", k = 8)
+
+# GLOBAL_FORMULA <- target_p95 ~
+#   s(doy, bs = "cc", k = 8) +
+#   s(log_q, k = 5) +
+#   s(deltaQ_24h, k = 5) +
+#   precip_3day +
+#   precip_event +
+#   s(melt_rate_7d, bs = "ts", k = 5)
+
+# Per-regime formulas — kept simple intentionally given low regime-specific N.
+# bs = "tp" for regime-specific DOY terms (data may not span full year,
+# so the cyclic constraint of "cc" is inappropriate).
+REGIME_FORMULAS <- list(
+  snowmelt   = target_p95 ~ s(doy, bs = "tp", k = 10) +
+    s(log_q, k = 10) +
+    s(melt_rate_7d, bs = "ts", k = 8),
+  convective = target_p95 ~ s(log_q, k = 8) +
+    s(deltaQ_24h, k = 8) +
+    precip_3day +
+    precip_event,
+  baseflow   = target_p95 ~ s(doy, bs = "cc", k = 10) +
+    s(log_q, k = 8) +
+    s(deltaQ_24h, k = 8)
+  
+)
+
+# REGIME_FORMULAS <- list(
+#   snowmelt   = target_p95 ~ s(doy, bs = "tp", k = 6) +
+#                              s(log_q, k = 5) +
+#                              s(melt_rate_7d, bs = "ts", k = 5),
+#   convective = target_p95 ~ s(log_q, k = 5) +
+#                              s(deltaQ_24h, k = 5) +
+#                              precip_3day +
+#                              precip_event,
+#   baseflow   = target_p95 ~ s(doy, bs = "cc", k = 8) +
+#                              s(log_q, k = 5)
+# )
+```
+
+---
+
+# Data
+
+```{r load-turb}
+turb <- read_csv(
+  here("data/collated/FC_intake/fc_intake_munroe_turbidity_quantile_record_2010-2025.csv")
+) %>%
+  filter(location == "intake_turb_NTU") %>%
+  select(date, doy, year, p95)
+```
+
+```{r load-flow}
+flow_data <- get_sw_ts(
+  abbrev     = "CLAFTCCO",
+  start_date = "2010-01-01",
+  end_date   = "2025-12-31",
+  timescale  = "day"
+) %>%
+  select(datetime, canyon_mouth_cfs = value) %>%
+  mutate(date = as.Date(datetime))
+```
+
+```{r load-precip}
+precip_data <- get_climate_ts(
+  site_id    = "US1COLR0815",
+  param      = "Precip",
+  start_date = "2010-01-01",
+  end_date   = "2025-12-31",
+  timescale  = "day"
+) %>%
+  select(datetime, redfeather_precip = value) %>%
+  mutate(date = as.Date(datetime))
+```
+
+```{r load-snotel}
+# SNOTEL sites in the Cache la Poudre HUC (10190007)
+snotel_sites <- snotel_info() %>%
+  filter(grepl("10190007", description))
+
+snotel_data <- snotel_download(
+  site_id  = snotel_sites$site_id,
+  internal = TRUE,
+  metric   = TRUE
+) %>%
+  mutate(date = ymd(date),
+         doy  = yday(date),
+         year = year(date))
+
+# PCA on SWE across sites — PC1 captures the dominant snowpack signal
+snotel_matrix <- snotel_data %>%
+  select(date, site_id, snow_water_equivalent) %>%
+  pivot_wider(names_from  = site_id,
+              names_prefix = "swe_",
+              values_from  = snow_water_equivalent) %>%
+  .[complete.cases(.), ]
+
+pca_snotel <- snotel_matrix %>%
+  select(starts_with("swe_")) %>%
+  prcomp(center = TRUE, scale. = TRUE)
+
+summary(pca_snotel)
+pca_snotel$rotation
+```
+
+```{r snotel-melt}
+# Compute SWE PC1 and melt rates (positive = losing snowpack)
+snotel <- tibble(swe_pca = pca_snotel$x[, 1], date = snotel_matrix$date) %>%
+  arrange(date) %>%
+  mutate(date_m7  = date - days(7),
+         date_m14 = date - days(14)) %>%
+  left_join(
+    select(., date, swe_pca) %>% rename(date_m7 = date, swe_pca_lag7 = swe_pca),
+    by = "date_m7"
+  ) %>%
+  left_join(
+    select(., date, swe_pca) %>% rename(date_m14 = date, swe_pca_lag14 = swe_pca),
+    by = "date_m14"
+  ) %>%
+  mutate(
+    melt_rate_7d  = (swe_pca_lag7  - swe_pca) / 7,
+    melt_rate_14d = (swe_pca_lag14 - swe_pca) / 14
+  ) %>%
+  select(date, swe_pca, melt_rate_7d, melt_rate_14d)
+
+# Confirm PC1 loads positively on all SWE sites before relying on melt_rate_7d sign
+pca_snotel$rotation[, 1]  # all should be positive (or all negative — flip MELT_THRESH sign if so)
+
+```
+The PC1 sign is confirmed as expected — positive loadings!
+accumulation = negative melt rate, ablation = positive.
+
+---
+
+# Feature Engineering & Regime Classification
+
+```{r features}
+model_data <- turb %>%
+  left_join(flow_data   %>% select(date, canyon_mouth_cfs), by = "date") %>%
+  left_join(precip_data %>% select(date, redfeather_precip), by = "date") %>%
+  left_join(snotel,                                          by = "date") %>%
+  arrange(date) %>%
+  mutate(
+    # Flow features
+    log_q      = log1p(canyon_mouth_cfs),
+    deltaQ_24h = canyon_mouth_cfs - lag(canyon_mouth_cfs, 1),
+    
+    # Precipitation features
+    precip       = replace_na(redfeather_precip, 0),
+    precip_3day  = roll_sum(replace_na(redfeather_precip, 0),
+                            n = 3, fill = NA, align = "right"),
+    precip_event = as.numeric(replace_na(redfeather_precip, 0) > PRECIP_THRESH),
+    
+    # Target: tomorrow's p95
+    target_p95 = lead(p95, 1)
+  ) %>%
+  mutate(
+    # Regime classification (priority: convective > snowmelt > baseflow)
+    regime = case_when(
+      # may through september
+      doy %in% 150:300 & precip_event == 1 | precip_3day > CONVECTIVE_PRECIP_THRESH  ~ "convective",
+      !is.na(melt_rate_7d) & melt_rate_7d > MELT_THRESH ~ "snowmelt",
+      .default =  "baseflow"
+    ),
+    regime = factor(regime, levels = c("snowmelt", "convective", "baseflow"))
+  )
+
+# Columns required to fit/predict any of the GAM formulas
+MODEL_COLS <- c("target_p95", "p95", "log_q", "deltaQ_24h",
+                "precip_3day", "precip_event", "melt_rate_7d", "doy", "regime")
+
+cat("Complete rows (all model columns):",
+    sum(complete.cases(model_data[, MODEL_COLS])), "of", nrow(model_data), "\n")
+
+model_data %>%
+  filter(complete.cases(.[, MODEL_COLS])) %>%
+  count(regime) %>%
+  mutate(pct = round(100 * n / sum(n), 1))
+```
+
+And look at snotel data distribution
+
+```{r}
+
+# Distribution of melt_rate_7d by month to inform threshold choice
+model_data %>%
+  mutate(month = month(date)) %>%
+  filter(!is.na(melt_rate_7d)) %>%
+  group_by(month) %>%
+  summarise(median_melt = median(melt_rate_7d), 
+            q75_melt = quantile(melt_rate_7d, 0.75))
+```
+accumulation = negative melt rate, ablation = positive.
+
+---
+
+# Regime Visualisation
+
+```{r regime-ts, fig.dim = c(10, 4)}
+model_data %>%
+  filter(complete.cases(.[, MODEL_COLS]), year %in% TRAIN_CV_YEARS) %>%
+  ggplot(aes(x = date, y = p95, color = regime)) +
+  geom_point(size = 0.5, alpha = 0.7) +
+  scale_color_manual(values = c(snowmelt = "#2166ac", convective = "#d73027",
+                                baseflow = "#4dac26")) +
+  scale_y_continuous(limits = c(0, NA)) +
+  theme_bw() +
+  labs(title = "Observed p95 turbidity coloured by regime (training years)",
+       x = NULL, y = "p95 turbidity (NTU)")
+```
+
+```{r regime-boxplot, fig.dim = c(6, 4)}
+model_data %>%
+  filter(complete.cases(.[, MODEL_COLS]), year %in% TRAIN_CV_YEARS) %>%
+  ggplot(aes(x = regime, y = p95, fill = regime)) +
+  geom_boxplot(outlier.size = 0.5) +
+  scale_fill_manual(values = c(snowmelt = "#2166ac", convective = "#d73027",
+                               baseflow = "#4dac26")) +
+  scale_y_log10() +
+  theme_bw() +
+  theme(legend.position = "none") +
+  labs(title = "p95 turbidity by regime (log scale)", x = NULL, y = "p95 NTU (log)")
+```
+
+---
+
+# Cross-Validation
+
+```{r cv-function}
+# Fits persistence, global GAM, and all three regime GAMs for one fold.
+# Returns a list with:
+#   $predictions  — tidy tibble of per-observation predictions on the val set
+#   $models       — list(global = ..., regime = list(...)) of fitted GAMs
+#   $train_data   — training data frame (used later for response curve medians)
+run_cv_fold <- function(k) {
+  val_yrs   <- cv_folds[[k]]
+  train_yrs <- setdiff(TRAIN_CV_YEARS, val_yrs)
+  
+  train <- model_data %>%
+    filter(year %in% train_yrs) %>%
+    drop_na(all_of(MODEL_COLS))
+  
+  val <- model_data %>%
+    filter(year %in% val_yrs) %>%
+    drop_na(all_of(MODEL_COLS))
+  
+  if (nrow(val) == 0) return(NULL)
+  
+  # ── Global GAM ───────────────────────────────────────────────────────────────
+  fit_global  <- gam(GLOBAL_FORMULA, data = train,
+                     family = Gamma(link = "log"), method = "REML")
+  global_pred <- as.numeric(predict(fit_global, newdata = val, type = "response"))
+  
+  # ── Regime GAMs — fit all regimes on training data ───────────────────────────
+  # Fit every regime regardless of whether it appears in val (needed for test
+  # ensemble later). Fall back to global GAM if too few training rows or error.
+  regime_fits <- map(levels(train$regime), function(r) {
+    train_r <- filter(train, regime == r)
+    if (nrow(train_r) < 10) return(fit_global)
+    tryCatch(
+      gam(REGIME_FORMULAS[[r]], data = train_r,
+          family = Gamma(link = "log"), method = "REML"),
+      error = function(e) fit_global
+    )
+  }) %>% set_names(levels(train$regime))
+  
+  # ── Hierarchical val predictions ─────────────────────────────────────────────
+  hier_pred <- rep(NA_real_, nrow(val))
+  for (r in levels(val$regime)) {
+    idx_r <- which(val$regime == r)
+    if (length(idx_r) == 0) next
+    hier_pred[idx_r] <- as.numeric(
+      predict(regime_fits[[r]], newdata = val[idx_r, ], type = "response")
+    )
+  }
+  
+  list(
+    predictions = tibble(
+      fold             = k,
+      date             = val$date,
+      regime           = val$regime,
+      observed         = val$target_p95,
+      persistence      = val$p95,
+      global_gam       = global_pred,
+      hierarchical_gam = hier_pred
+    ),
+    models     = list(global = fit_global, regime = regime_fits),
+    train_data = train
+  )
+}
+```
+
+```{r run-cv}
+cv_out     <- map(seq_along(cv_folds), run_cv_fold)
+cv_results <- map(cv_out, "predictions") %>% bind_rows()
+```
+
+## CV Metrics Summary
+
+```{r cv-metrics}
+cv_long <- cv_results %>%
+  pivot_longer(cols = c(persistence, global_gam, hierarchical_gam),
+               names_to = "model", values_to = "predicted") %>%
+  filter(!is.na(predicted))
+
+# Per-fold metrics
+fold_metrics <- cv_long %>%
+  group_by(model, fold) %>%
+  summarise(
+    rmse = rmse(observed, predicted),
+    mae  = mae(observed, predicted),
+    bias = mean(predicted - observed),
+    .groups = "drop"
+  )
+
+fold_metrics %>%
+  group_by(model) %>%
+  summarise(
+    rmse_mean = mean(rmse), rmse_sd = sd(rmse),
+    mae_mean  = mean(mae),  mae_sd  = sd(mae),
+    bias_mean = mean(bias),
+    .groups = "drop"
+  ) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 2))) %>%
+  arrange(rmse_mean)
+```
+
+```{r cv-scatter, fig.dim = c(9, 3)}
+cv_long %>%
+  mutate(model = recode(model,
+                        persistence      = "Persistence",
+                        global_gam       = "Global GAM",
+                        hierarchical_gam = "Hierarchical GAM"
+  )) %>%
+  ggplot(aes(x = observed, y = predicted, color = regime)) +
+  geom_point(alpha = 0.3, size = 0.6) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  scale_color_manual(values = c(snowmelt = "#2166ac", convective = "#d73027",
+                                baseflow = "#4dac26")) +
+  facet_wrap(~ model) +
+  theme_bw() +
+  labs(title = "CV: Predicted vs Observed p95 turbidity (NTU)",
+       x = "Observed (NTU)", y = "Predicted (NTU)")
+```
+
+```{r cv-highturb}
+# Performance restricted to high-turbidity events
+cv_long %>%
+  filter(observed >= HIGH_TURB_THRESH) %>%
+  group_by(model) %>%
+  summarise(
+    n    = n(),
+    rmse = rmse(observed, predicted),
+    mae  = mae(observed, predicted),
+    bias = mean(predicted - observed),
+    .groups = "drop"
+  ) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 2))) %>%
+  arrange(rmse) %>%
+  print()
+```
+
+```{r cv-by-regime}
+# Per-regime breakdown for the hierarchical model
+cv_long %>%
+  filter(model == "hierarchical_gam") %>%
+  group_by(regime) %>%
+  summarise(
+    n    = n(),
+    rmse = rmse(observed, predicted),
+    mae  = mae(observed, predicted),
+    bias = mean(predicted - observed),
+    .groups = "drop"
+  ) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 2)))
+```
+
+## CV Validation Time Series
+
+One panel per fold, showing observed p95 (coloured by regime), hierarchical GAM
+prediction (black line), and persistence (dashed). Useful for spotting whether
+the model tracks event timing and magnitude across different years.
+
+```{r cv-ts, fig.dim = c(10, 4)}
+cv_results %>%
+  mutate(fold_label = paste0("Fold ", fold, " (", map_chr(fold, ~ paste(cv_folds[[.x]], collapse = "–")), ")")) %>%
+  ggplot(aes(x = date)) +
+  geom_point(aes(y = observed, color = regime), size = 0.8, alpha = 0.8) +
+  geom_line(aes(y = hierarchical_gam), color = "black", linewidth = 0.5) +
+  geom_line(aes(y = persistence), color = "grey50", linewidth = 0.4, linetype = "dashed") +
+  geom_hline(yintercept = HIGH_TURB_THRESH, linetype = "dotted", color = "grey40") +
+  scale_color_manual(values = c(snowmelt = "#2166ac", convective = "#d73027",
+                                baseflow = "#4dac26")) +
+  scale_y_continuous(limits = c(0, NA)) +
+  facet_wrap(~ fold_label, scales = "free_x", ncol = 1) +
+  theme_bw() +
+  theme(legend.position = "bottom") +
+  labs(
+    title = "CV validation folds: observed (coloured), hierarchical GAM (black), persistence (dashed)",
+    x = NULL, y = "p95 turbidity (NTU)"
+  )
+```
+
+---
+
+# CV Model Inspection
+
+Rather than fitting a separate final model on all training data, we use the
+ensemble of CV fold models throughout — for response curves, diagnostics, and
+test set prediction. This incorporates interannual variability across the full
+training record and avoids a separate train/inspect split.
+
+## Response Curves
+
+Each line is one CV fold's fitted response; the spread across folds reflects
+how much the estimated effect varies with different training years excluded.
+Other predictors are held at the fold's regime-specific training median.
+
+```{r gam-response-helper}
+# Predict along one predictor, others at training median.
+# Returns predictions on response scale with 95% CI.
+pred_curve <- function(model, data, var, n = 80) {
+  base <- data %>%
+    summarise(across(where(is.numeric), ~median(.x, na.rm = TRUE)))
+  grid <- base %>%
+    slice(rep(1, n)) %>%
+    mutate(!!var := seq(min(data[[var]], na.rm = TRUE),
+                        max(data[[var]], na.rm = TRUE),
+                        length.out = n))
+  p <- predict(model, newdata = grid, type = "link", se.fit = TRUE)
+  grid %>%
+    mutate(predicted = exp(p$fit),
+           lower     = exp(p$fit - 1.96 * p$se.fit),
+           upper     = exp(p$fit + 1.96 * p$se.fit))
+}
+```
+
+```{r gam-flow-response, fig.dim = c(9, 3)}
+# Flow response per regime — all CV folds overlaid.
+flow_curves <- map_dfr(seq_along(cv_out), function(k) {
+  imap_dfr(cv_out[[k]]$models$regime, function(fit, nm) {
+    train_r <- filter(cv_out[[k]]$train_data, regime == nm)
+    if (nrow(train_r) < 10) return(NULL)
+    pred_curve(fit, train_r, "log_q") %>%
+      mutate(regime = nm, fold = k, cfs = expm1(log_q))
+  })
+})
+
+ggplot(flow_curves, aes(x = cfs, y = predicted,
+                        color = regime, group = interaction(fold, regime))) +
+  geom_line(alpha = 0.4, linewidth = 0.6) +
+  scale_color_manual(values = c(snowmelt = "#2166ac", convective = "#d73027",
+                                baseflow = "#4dac26")) +
+  scale_x_log10(labels = scales::comma) +
+  facet_wrap(~ regime, scales = "free") +
+  theme_bw() +
+  theme(legend.position = "none") +
+  labs(title = "Regime GAMs: fitted turbidity vs flow — all CV folds",
+       x = "Canyon mouth flow (CFS, log scale)", y = "Predicted p95 (NTU)")
+```
+
+```{r gam-doy-response, fig.dim = c(6, 3)}
+# Seasonal baseline — global GAM DOY effect, all CV folds.
+doy_curves <- map_dfr(seq_along(cv_out), function(k) {
+  pred_curve(cv_out[[k]]$models$global, cv_out[[k]]$train_data, "doy") %>%
+    mutate(fold = k)
+})
+
+ggplot(doy_curves, aes(x = doy, y = predicted, group = fold)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.08, fill = "grey40") +
+  geom_line(alpha = 0.5, linewidth = 0.6, color = "grey30") +
+  theme_bw() +
+  labs(title = "Global GAM: seasonal baseline — all CV folds",
+       x = "Day of year", y = "Predicted p95 (NTU)")
+```
+
+```{r gam-melt-response, fig.dim = c(7, 3)}
+# Snowmelt GAM: melt rate effect at median flow — all CV folds.
+melt_curves <- map_dfr(seq_along(cv_out), function(k) {
+  train_r <- filter(cv_out[[k]]$train_data, regime == "snowmelt")
+  if (nrow(train_r) < 10) return(NULL)
+  pred_curve(cv_out[[k]]$models$regime$snowmelt, train_r, "melt_rate_7d") %>%
+    mutate(fold = k)
+})
+
+ggplot(melt_curves, aes(x = melt_rate_7d, y = predicted, group = fold)) +
+  geom_line(alpha = 0.5, linewidth = 0.6, color = "#2166ac") +
+  theme_bw() +
+  labs(title = "Snowmelt GAM: turbidity vs 7-day melt rate (median flow) — all CV folds",
+       x = "7-day melt rate (SWE PC1 units / day)", y = "Predicted p95 (NTU)")
+```
+
+```{r gam-convective-precip, fig.dim = c(7, 3)}
+# Convective GAM: antecedent precip effect — event vs non-event, all CV folds.
+precip_curves <- map_dfr(seq_along(cv_out), function(k) {
+  train_r <- filter(cv_out[[k]]$train_data, regime == "convective")
+  if (nrow(train_r) < 10) return(NULL)
+  map_dfr(c(0, 1), function(evt) {
+    base <- train_r %>%
+      summarise(across(where(is.numeric), ~median(.x, na.rm = TRUE))) %>%
+      mutate(precip_event = evt)
+    grid <- base %>%
+      slice(rep(1, 80)) %>%
+      mutate(precip_3day = seq(0, quantile(train_r$precip_3day, 0.95, na.rm = TRUE),
+                               length.out = 80))
+    p <- predict(cv_out[[k]]$models$regime$convective,
+                 newdata = grid, type = "link", se.fit = TRUE)
+    grid %>%
+      mutate(predicted   = exp(p$fit),
+             fold        = k,
+             event_label = if_else(evt == 1, "Precip event day", "No event"))
+  })
+})
+
+ggplot(precip_curves,
+       aes(x = precip_3day, y = predicted,
+           color = event_label, group = interaction(fold, event_label))) +
+  geom_line(alpha = 0.45, linewidth = 0.6) +
+  scale_color_manual(values = c("Precip event day" = "#d73027", "No event" = "grey40"),
+                     name = NULL) +
+  theme_bw() +
+  labs(title = "Convective GAM: turbidity vs antecedent precip — all CV folds",
+       x = "3-day rolling precip (inches)", y = "Predicted p95 (NTU)")
+```
+
+## Model Diagnostics
+
+Compact edf/k' table across all folds to flag any smooths being constrained
+(edf ≈ k' − 1 suggests `k` should be increased). Full diagnostics shown for
+fold 3 as a representative example.
+
+```{r diag-edf-table}
+# edf and k' for every smooth term, every fold and regime
+map_dfr(seq_along(cv_out), function(k) {
+  # Regime GAMs
+  imap_dfr(cv_out[[k]]$models$regime, function(fit, nm) {
+    st <- summary(fit)$s.table
+    tibble(fold = k, model = paste0("regime:", nm),
+           term = rownames(st), edf = st[, "edf"], k_prime = st[, "Ref.df"])
+  }) %>%
+    bind_rows(
+      # Global GAM
+      {
+        st <- summary(cv_out[[k]]$models$global)$s.table
+        tibble(fold = k, model = "global",
+               term = rownames(st), edf = st[, "edf"], k_prime = st[, "Ref.df"])
+      }
+    )
+}) %>%
+  mutate(constrained = edf > k_prime - 1) %>%
+  group_by(model, term) %>%
+  summarise(edf_mean  = round(mean(edf), 2),
+            edf_range = paste0(round(min(edf), 1), "–", round(max(edf), 1)),
+            k_prime   = round(mean(k_prime), 1),
+            any_constrained = any(constrained),
+            .groups = "drop") %>%
+  arrange(model, term) %>%
+  print(n = Inf)
+```
+
+```{r diag-fold3, fig.dim = c(9, 4)}
+# Full gam.check and partial effects for fold 3 (representative)
+cat("── Global GAM, fold 3 ──\n")
+summary(cv_out[[3]]$models$global)
+gam.check(cv_out[[3]]$models$global)
+plot(cv_out[[3]]$models$global, pages = 1, residuals = TRUE, shade = TRUE,
+     main = "Global GAM partial effects, fold 3 (link scale)")
+
+walk2(cv_out[[3]]$models$regime, names(cv_out[[3]]$models$regime), function(fit, nm) {
+  n_r <- filter(cv_out[[3]]$train_data, regime == nm) %>% nrow()
+  cat("\n── Regime:", nm, "| fold 3 training n =", n_r, "──\n")
+  print(summary(fit))
+  plot(fit, pages = 1, residuals = TRUE, shade = TRUE,
+       main = paste("Partial effects —", nm, ", fold 3 (link scale)"))
+})
+```
+
+---
+
+# Test Set Evaluation (2024–2025)
+
+Predictions are the **mean across all 5 CV fold models** (ensemble). The
+fold-to-fold SD is retained as a rough indicator of prediction uncertainty
+from interannual variability in the training data.
+
+```{r test-eval}
+test_df <- model_data %>%
+  filter(year %in% TEST_YEARS) %>%
+  drop_na(all_of(MODEL_COLS))
+
+# Predict using each fold's models
+test_by_fold <- map_dfr(seq_along(cv_out), function(k) {
+  fold_models <- cv_out[[k]]$models
+  
+  global_pred <- as.numeric(
+    predict(fold_models$global, newdata = test_df, type = "response")
+  )
+  
+  hier_pred <- rep(NA_real_, nrow(test_df))
+  for (r in levels(test_df$regime)) {
+    idx_r <- which(test_df$regime == r)
+    if (length(idx_r) == 0) next
+    hier_pred[idx_r] <- as.numeric(
+      predict(fold_models$regime[[r]], newdata = test_df[idx_r, ], type = "response")
+    )
+  }
+  
+  tibble(fold = k, date = test_df$date, regime = test_df$regime,
+         observed = test_df$target_p95, persistence = test_df$p95,
+         global_gam = global_pred, hierarchical_gam = hier_pred)
+})
+
+# Ensemble: mean and SD across folds
+test_results <- test_by_fold %>%
+  group_by(date, regime, observed, persistence) %>%
+  summarise(
+    global_ensemble = mean(global_gam,       na.rm = TRUE),
+    hier_ensemble   = mean(hierarchical_gam, na.rm = TRUE),
+    hier_sd         = sd(hierarchical_gam,   na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# ── Metrics ──────────────────────────────────────────────────────────────────
+test_results %>%
+  pivot_longer(c(persistence, global_ensemble, hier_ensemble),
+               names_to = "model", values_to = "predicted") %>%
+  group_by(model) %>%
+  summarise(
+    n    = n(),
+    rmse = rmse(observed, predicted),
+    mae  = mae(observed, predicted),
+    bias = mean(predicted - observed),
+    .groups = "drop"
+  ) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 2))) %>%
+  arrange(rmse)
+```
+
+```{r test-scatter, fig.dim = c(9, 3)}
+test_results %>%
+  pivot_longer(c(persistence, global_ensemble, hier_ensemble),
+               names_to = "model", values_to = "predicted") %>%
+  mutate(model = recode(model,
+                        persistence      = "Persistence",
+                        global_ensemble  = "Global GAM ensemble",
+                        hier_ensemble    = "Hierarchical GAM ensemble"
+  )) %>%
+  ggplot(aes(x = observed, y = predicted, color = regime)) +
+  geom_point(alpha = 0.6) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  scale_color_manual(values = c(snowmelt = "#2166ac", convective = "#d73027",
+                                baseflow = "#4dac26")) +
+  facet_wrap(~ model) +
+  theme_bw() +
+  labs(title = "Test set (2024–2025): Predicted vs Observed p95 turbidity",
+       x = "Observed (NTU)", y = "Predicted (NTU)")
+```
+
+```{r test-ts, fig.dim = c(10, 4)}
+# Ribbon shows ±1 SD across fold predictions (ensemble spread)
+test_results %>%
+  ggplot(aes(x = date)) +
+  geom_point(aes(y = observed, color = regime), size = 1, alpha = 0.8) +
+  geom_ribbon(aes(ymin = hier_ensemble - hier_sd,
+                  ymax = hier_ensemble + hier_sd), alpha = 0.15) +
+  geom_line(aes(y = hier_ensemble), color = "black", linewidth = 0.6) +
+  geom_line(aes(y = persistence), color = "grey50", linewidth = 0.4, linetype = "dashed") +
+  geom_hline(yintercept = HIGH_TURB_THRESH, linetype = "dotted", color = "grey40") +
+  scale_color_manual(values = c(snowmelt = "#2166ac", convective = "#d73027",
+                                baseflow = "#4dac26")) +
+  scale_y_continuous(limits = c(0, NA)) +
+  theme_bw() +
+  labs(
+    title = "Test period: observed (coloured), hierarchical ensemble (black ± fold SD), persistence (dashed)",
+    x = NULL, y = "p95 turbidity (NTU)"
+  )
+```
+
+```{r test-highturb}
+test_results %>%
+  filter(observed >= HIGH_TURB_THRESH) %>%
+  pivot_longer(c(persistence, global_ensemble, hier_ensemble),
+               names_to = "model", values_to = "predicted") %>%
+  group_by(model) %>%
+  summarise(
+    n    = n(),
+    rmse = rmse(observed, predicted),
+    mae  = mae(observed, predicted),
+    bias = mean(predicted - observed),
+    .groups = "drop"
+  ) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 2))) %>%
+  arrange(rmse)
+```
+
+---
+
+# Export Models
+
+```{r export}
+dir.create(here("data/derived/models/turbidity"), showWarnings = FALSE, recursive = TRUE)
+
+today <- format(Sys.Date(), "%Y-%m-%d")
+
+# Save all CV fold models as a list — operational prediction averages across all
+# folds (see Notes for prediction workflow)
+write_rds(map(cv_out, "models"),
+          here(paste0("data/derived/models/turbidity/turbidity_intake_GAM_cv_ensemble_v", today, ".rds")))
+
+# Save the SWE PCA model — required to compute melt_rate_7d for new predictions
+write_rds(pca_snotel,
+          here(paste0("data/derived/models/turbidity/SWE_PCA_v", today, ".rds")))
+```
+
+---
+
+# Notes
+
+**Model selection:** Compare global vs hierarchical on both CV and test RMSE,
+particularly on high-turbidity events (`observed >= HIGH_TURB_THRESH`). The
+hierarchical model is preferred if it improves high-turbidity performance without
+degrading baseflow performance, since getting high-turbidity events right matters
+most operationally.
+
+**Regime boundary tuning:** The thresholds in `constants` (`MELT_THRESH`,
+`CONVECTIVE_PRECIP_THRESH`, `PRECIP_THRESH`) are initial estimates. Worth
+adjusting if the regime counts (see `model_data %>% count(regime)`) produce
+very unequal splits or if regime-specific model diagnostics look poor.
+
+**GAM complexity:** All formulas use modest `k` values (5–8) given the limited
+per-regime N. Run `gam.check()` on each final model — if edf ≈ k' for any smooth,
+the effective degrees of freedom are being constrained and `k` should be increased.
+Do this cautiously; the model should remain conservative.
+
+**Gamma(link = "log") caution:** Predictions extrapolate on a log scale and can
+grow rapidly. Check for implausibly high predictions on the test set, especially
+during the convective regime. If prediction intervals are needed operationally,
+use `predict(..., se.fit = TRUE)` and propagate the SE on the log scale.
+
+**Features to consider adding:**
+- Munroe turbidity as an upstream leading indicator (check data availability)
+- 14-day melt rate (see TOC baseline — showed value there)
+- Longer antecedent precip windows (7-day sum)
+
+**Operational use:** To generate a forecast on day *t*:
+
+1. Load `cv_ensemble` (list of 5 fold model lists) and `pca_snotel`
+2. Observe today's canyon mouth flow, precip, and SNOTEL SWE
+3. Project SNOTEL SWE onto `pca_snotel` to get `swe_pca`; compute `melt_rate_7d`
+4. Classify regime using thresholds above
+5. For each fold model, predict with the appropriate regime GAM; average the 5 predictions:
+```r
+mean(map_dbl(cv_ensemble, ~ predict(.x$regime[[regime]], newdata = today_features, type = "response")))
+```
