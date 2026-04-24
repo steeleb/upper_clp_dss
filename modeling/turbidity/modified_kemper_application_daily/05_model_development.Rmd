@@ -1,0 +1,435 @@
+---
+title: "05_model_development — Daily p95 Turbidity Forecast (Modified Kemper)"
+author: "ROSSyndicate"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+library(here)
+library(tidyverse)
+library(lubridate)
+library(arrow)
+library(mgcv)
+library(quantreg)
+library(hydroGOF)
+library(lightgbm)
+library(tidymodels)
+library(bonsai)
+
+# Source helper functions
+source(knitr::purl(here("modeling/turbidity/modified_kemper_application_daily/00_functions.Rmd"),
+                   quiet = TRUE))
+```
+
+# Purpose
+
+Develop and cross-validate two model families for daily p95 turbidity forecasting
+at the FC Intake. Following the Kemper et al. dual-model approach:
+
+1. **Hierarchical GAM** — three regime-specific GAMs (snowmelt, convective,
+   baseflow) plus a global GAM benchmark. Adapted from `intake_turbidity_forecast_poc.Rmd`.
+
+2. **LightGBM** — gradient-boosted model with full antecedent feature set.
+   Adapted from `kemper_application/02_model_development.Rmd`.
+
+Models are fit for each of three lead times (t+1, t+2, t+3).
+
+**Train/CV/test split:**
+- Training + CV: 2010–2023 (5-fold year-grouped CV)
+- Test (held out): 2024–2025
+
+---
+
+# Constants
+
+```{r constants}
+TRAIN_CV_YEARS <- 2010:2023
+TEST_YEARS     <- 2024:2025
+HIGH_TURB_THRESH <- 75  # NTU — threshold for high-turbidity event evaluation
+
+# 5 grouped-year CV folds
+cv_folds <- list(
+  fold_1 = 2010:2012,
+  fold_2 = 2013:2015,
+  fold_3 = 2016:2018,
+  fold_4 = 2019:2020,
+  fold_5 = 2021:2023
+)
+
+# Columns required for any model (GAM-safe: no temperature interaction)
+MODEL_COLS <- c("p95", "log_q", "deltaQ_24h",
+                "precip_3day", "precip_event",
+                "melt_rate_7d", "doy", "regime")
+
+# All candidate LightGBM predictors (superset; includes temp features for 2018+)
+LGBM_CANDIDATE_PREDS <- c(
+  "log_q", "log_q_sq", "log_limb", "dq_q",
+  "deltaQ_24h", "deltaQ_48h",
+  "mean_q_7d", "mean_q_30d", "mean_q_90d",
+  "max_q_30d", "max_q_90d", "max_q_365d",
+  "time_since_30d_peak", "time_since_90d_peak", "time_since_annual_peak",
+  "swe_pc1", "melt_rate_7d", "melt_rate_14d",
+  "precip", "precip_3day", "precip_7day", "precip_event",
+  "tmax_5d_mean", "swe_x_tmax",
+  "doy", "regime"
+)
+
+# GAM formulas — Gamma(link="log"); target column renamed to `target_p95` in helper
+GLOBAL_FORMULA <- target_p95 ~
+  s(doy, bs = "cc", k = 10) +
+  s(log_q, k = 10) +
+  s(deltaQ_24h, k = 8) +
+  precip_event +
+  s(melt_rate_7d, bs = "ts", k = 8)
+
+REGIME_FORMULAS <- list(
+  snowmelt   = target_p95 ~
+    s(log_q, k = 10) +
+    s(melt_rate_7d, bs = "ts", k = 8),
+  convective = target_p95 ~
+    s(log_q, k = 8) +
+    s(deltaQ_24h, k = 8) +
+    precip_event,
+  baseflow   = target_p95 ~
+    s(doy, bs = "cc", k = 10) +
+    s(log_q, k = 8)
+)
+```
+
+---
+
+# Load Data
+
+```{r load-data}
+model_data <- read_parquet(
+  here("data/derived/models/turbidity_forecast/daily_model_data.parquet")
+) %>%
+  mutate(regime = factor(regime, levels = c("snowmelt", "convective", "baseflow")))
+
+cat("Total rows:", nrow(model_data), "\n")
+
+train_cv_data <- model_data %>% filter(year %in% TRAIN_CV_YEARS)
+test_data      <- model_data %>% filter(year %in% TEST_YEARS)
+
+cat("Train+CV rows:", nrow(train_cv_data), "| Test rows:", nrow(test_data), "\n")
+```
+
+---
+
+# Model A: Hierarchical GAM
+
+## Cross-Validation
+
+```{r gam-cv}
+# run_gam_cv_fold() defined in 00_functions.Rmd
+# Run CV for each lead time (1, 2, 3) and bind results
+
+gam_cv_preds <- map_dfr(1:3, function(lead) {
+  map_dfr(names(cv_folds), function(k) {
+    run_gam_cv_fold(
+      k              = k,
+      model_data     = train_cv_data,
+      cv_folds       = cv_folds,
+      TRAIN_CV_YEARS = TRAIN_CV_YEARS,
+      MODEL_COLS     = MODEL_COLS,
+      GLOBAL_FORMULA = GLOBAL_FORMULA,
+      REGIME_FORMULAS = REGIME_FORMULAS,
+      lead           = lead
+    )
+  })
+})
+
+cat("CV prediction rows:", nrow(gam_cv_preds), "\n")
+```
+
+```{r gam-cv-metrics}
+# Compute performance metrics for each model × lead time
+gam_cv_metrics <- gam_cv_preds %>%
+  drop_na(observed, global_pred, regime_pred, persistence) %>%
+  group_by(lead) %>%
+  summarise(
+    persistence = error_estimator(persistence, observed, "persistence")$rmse,
+    global_gam  = error_estimator(global_pred,  observed, "global")$rmse,
+    regime_gam  = error_estimator(regime_pred,  observed, "regime")$rmse,
+    .groups = "drop"
+  )
+
+cat("GAM cross-validation RMSE by lead time:\n")
+print(gam_cv_metrics)
+```
+
+## Fit Final GAMs on Full Training Period (2010–2023)
+
+```{r gam-final-fit}
+# Final models retrained on ALL 2010–2023 data for test-period evaluation
+final_gam_models <- map(1:3, function(lead) {
+  target_col <- paste0("target_p95_t", lead)
+
+  train_full <- train_cv_data %>%
+    rename(target_p95 = !!target_col) %>%
+    drop_na(all_of(c(MODEL_COLS, "target_p95")))
+
+  list(
+    global = gam(GLOBAL_FORMULA, data = train_full,
+                 family = Gamma(link = "log"), method = "REML"),
+    regime = map(REGIME_FORMULAS, function(f) {
+      gam(f, data = train_full, family = Gamma(link = "log"), method = "REML")
+    })
+  )
+})
+names(final_gam_models) <- paste0("lead_t", 1:3)
+
+cat("Final GAMs fitted for leads t+1, t+2, t+3.\n")
+```
+
+```{r gam-summary}
+# Brief summary of each global GAM
+map(names(final_gam_models), function(nm) {
+  cat("\n---", nm, "Global GAM ---\n")
+  print(summary(final_gam_models[[nm]]$global))
+})
+```
+
+---
+
+# Model B: LightGBM
+
+LightGBM is fit separately for each lead time. Variable selection and
+hyperparameter tuning use expanding-window CV (adapts `lgbm_tuner_daily()`
+from `00_functions.Rmd`, which mirrors `kemper_application/02_model_development.Rmd`).
+
+## Data Preparation — Log-Transform Target
+
+```{r lgbm-data-prep}
+# LightGBM is trained on log10(p95) to compress the right tail
+# Regime is converted to integer for LightGBM (1 = snowmelt, 2 = convective, 3 = baseflow)
+lgbm_base <- train_cv_data %>%
+  filter(!is.na(p95), p95 > 0) %>%
+  mutate(
+    log_p95_t1 = log10(lead(p95, 1)),
+    log_p95_t2 = log10(lead(p95, 2)),
+    log_p95_t3 = log10(lead(p95, 3)),
+    regime_int = as.integer(regime)
+  ) %>%
+  # Replace regime factor with integer for LightGBM
+  mutate(regime = regime_int) %>%
+  select(-regime_int)
+```
+
+## Variable Selection + Hyperparameter Tuning
+
+```{r lgbm-varsel-tune, eval=FALSE}
+# NOTE: eval=FALSE — this is computationally expensive.
+# Run once and save results; reload from cache below.
+
+lgbm_tuning_results <- map(1:3, function(lead) {
+  response_col <- paste0("log_p95_t", lead)
+  cat("\n=== LightGBM variable selection: lead t+", lead, "===\n")
+
+  lgbm_tuner_daily(
+    df           = lgbm_base,
+    all_preds    = LGBM_CANDIDATE_PREDS,
+    response_col = response_col
+  )
+})
+names(lgbm_tuning_results) <- paste0("lead_t", 1:3)
+
+# Save tuning results
+saveRDS(lgbm_tuning_results,
+        here("data/derived/models/turbidity_forecast/lgbm_tuning_results.rds"))
+```
+
+```{r lgbm-load-tuning}
+# Load previously cached tuning results
+lgbm_tuning_results <- readRDS(
+  here("data/derived/models/turbidity_forecast/lgbm_tuning_results.rds")
+)
+
+# Report selected predictors and hyperparameters per lead time
+map(names(lgbm_tuning_results), function(nm) {
+  res <- lgbm_tuning_results[[nm]]
+  cat("\n---", nm, "---\n")
+  cat("Selected predictors:", paste(res$best_predictors, collapse = ", "), "\n")
+  cat("Best min_n:", res$best_params$min_n,
+      "| Best num_leaves:", res$best_params$num_leaves, "\n")
+})
+```
+
+## Train Final LightGBM Models
+
+```{r lgbm-final-train, eval=FALSE}
+final_lgbm_models <- map(1:3, function(lead) {
+  response_col <- paste0("log_p95_t", lead)
+  res          <- lgbm_tuning_results[[paste0("lead_t", lead)]]
+
+  train_d <- lgbm_base %>%
+    filter(year %in% TRAIN_CV_YEARS) %>%
+    select(all_of(c(response_col, res$best_predictors))) %>%
+    filter(is.finite(.data[[response_col]]))
+
+  train_mat   <- data.matrix(train_d %>% select(!all_of(response_col)))
+  train_label <- train_d[[response_col]]
+  lgbm_ds     <- lgb.Dataset(train_mat, label = train_label)
+
+  final_params <- list(
+    objective        = "regression",
+    num_leaves       = res$best_params$num_leaves,
+    min_data_in_leaf = res$best_params$min_n,
+    learning_rate    = 0.1,
+    num_threads      = 4L,
+    verbose          = -1L
+  )
+
+  set.seed(913)
+  lgbm_mod <- lgb.train(final_params, data = lgbm_ds, nrounds = 100L)
+
+  # Smearing factor (Duan 1983)
+  smear_d <- mean(10^(train_label - predict(lgbm_mod, data = train_mat)),
+                  na.rm = TRUE)
+
+  cat("Lead t+", lead, "smearing factor:", round(smear_d, 4), "\n")
+
+  list(model   = lgbm_mod,
+       smear_d = smear_d,
+       preds   = res$best_predictors)
+})
+names(final_lgbm_models) <- paste0("lead_t", 1:3)
+
+# Save models
+map(names(final_lgbm_models), function(nm) {
+  lgb.save(
+    final_lgbm_models[[nm]]$model,
+    filename = here("data/derived/models/turbidity_forecast",
+                    paste0("lgbm_daily_", nm, ".txt"))
+  )
+})
+
+# Save smearing factors and predictor lists
+lgbm_model_meta <- map(final_lgbm_models,
+                       ~ list(smear_d = .x$smear_d, preds = .x$preds))
+saveRDS(lgbm_model_meta,
+        here("data/derived/models/turbidity_forecast/lgbm_model_meta.rds"))
+```
+
+---
+
+# Test Period Evaluation
+
+```{r test-eval}
+test_input <- test_data %>%
+  mutate(
+    log_p95_t1 = log10(lead(p95, 1)),
+    log_p95_t2 = log10(lead(p95, 2)),
+    log_p95_t3 = log10(lead(p95, 3)),
+    regime_int = as.integer(regime)
+  ) %>%
+  mutate(regime = regime_int) %>%
+  select(-regime_int)
+
+lgbm_model_meta <- readRDS(
+  here("data/derived/models/turbidity_forecast/lgbm_model_meta.rds")
+)
+
+all_test_results <- map_dfr(1:3, function(lead) {
+  response_col <- paste0("log_p95_t", lead)
+  meta         <- lgbm_model_meta[[paste0("lead_t", lead)]]
+
+  lgbm_mod <- lgb.load(
+    filename = here("data/derived/models/turbidity_forecast",
+                    paste0("lgbm_daily_lead_t", lead, ".txt"))
+  )
+
+  test_d   <- test_input %>%
+    select(date, year, doy, regime, p95, all_of(response_col),
+           all_of(meta$preds)) %>%
+    filter(is.finite(.data[[response_col]]))
+  test_mat <- data.matrix(test_d %>% select(all_of(meta$preds)))
+
+  lgbm_pred <- (10^predict(lgbm_mod, data = test_mat)) * meta$smear_d
+
+  # GAM predictions
+  gam_final <- final_gam_models[[paste0("lead_t", lead)]]
+  gam_global <- as.numeric(predict(gam_final$global,
+                                   newdata = test_d, type = "response"))
+  gam_regime <- map2_dbl(
+    as.character(test_d$regime), seq_len(nrow(test_d)),
+    ~ as.numeric(predict(gam_final$regime[[.x]],
+                         newdata = test_d[.y, ], type = "response"))
+  )
+
+  tibble(
+    date        = test_d$date,
+    lead        = lead,
+    regime      = test_d$regime,
+    observed    = 10^test_d[[response_col]],
+    persistence = test_d$p95,
+    gam_global  = gam_global,
+    gam_regime  = gam_regime,
+    lgbm        = lgbm_pred
+  )
+})
+```
+
+```{r test-metrics}
+all_test_results %>%
+  drop_na() %>%
+  group_by(lead) %>%
+  summarise(
+    persistence = error_estimator(persistence, observed, "persistence")$rmse,
+    gam_global  = error_estimator(gam_global,  observed, "gam_global")$rmse,
+    gam_regime  = error_estimator(gam_regime,  observed, "gam_regime")$rmse,
+    lgbm        = error_estimator(lgbm,        observed, "lgbm")$rmse,
+    .groups = "drop"
+  ) %>%
+  knitr::kable(digits = 2, caption = "Test-period RMSE by model and lead time")
+```
+
+```{r test-timeseries, fig.dim = c(12, 5)}
+# Test-period time series for t+1
+all_test_results %>%
+  filter(lead == 1) %>%
+  pivot_longer(cols = c(observed, persistence, gam_regime, lgbm),
+               names_to = "series", values_to = "turb_ntu") %>%
+  ggplot(aes(x = date, y = turb_ntu, color = series)) +
+  geom_line(linewidth = 0.5, alpha = 0.85) +
+  scale_color_manual(values = c(observed = "black", persistence = "grey50",
+                                gam_regime = "#2166ac", lgbm = "#d73027")) +
+  scale_y_log10() +
+  theme_bw() +
+  labs(title = "Test period (2024–2025): t+1 forecast vs. observed p95 NTU",
+       x = NULL, y = "p95 NTU (log scale)", color = NULL)
+```
+
+---
+
+# Variable Importance (LightGBM)
+
+```{r lgbm-varimp, fig.dim = c(8, 5)}
+# Show feature importance for t+1 model
+lgbm_t1 <- lgb.load(
+  here("data/derived/models/turbidity_forecast/lgbm_daily_lead_t1.txt")
+)
+
+lgb.importance(lgbm_t1, percentage = TRUE) %>%
+  as_tibble() %>%
+  slice_max(Gain, n = 15) %>%
+  ggplot(aes(x = reorder(Feature, Gain), y = Gain)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  theme_bw() +
+  labs(title = "LightGBM (t+1): Top 15 features by mean Gain",
+       x = NULL, y = "Mean Gain (%)")
+```
+
+---
+
+# Save GAM Objects
+
+```{r save-gams}
+saveRDS(final_gam_models,
+        here("data/derived/models/turbidity_forecast/final_gam_models.rds"))
+cat("GAM models saved.\n")
+```

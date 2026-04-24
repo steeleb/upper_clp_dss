@@ -1,0 +1,226 @@
+---
+title: "03_feature_engineering — Daily p95 Turbidity Forecast (Modified Kemper)"
+author: "ROSSyndicate"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+library(here)
+library(tidyverse)
+library(lubridate)
+library(slider)
+library(arrow)
+
+# Source helper functions
+source(knitr::purl(here("modeling/turbidity/modified_kemper_application_daily/00_functions.Rmd"),
+                   quiet = TRUE))
+```
+
+# Purpose
+
+Build the complete modelling dataset from `daily_obs_drivers_clean.parquet`.
+Computes all predictor features (flow antecedents, snow/melt, precipitation,
+temperature interaction) and the regime classification, then creates 1-, 2-,
+and 3-day lead targets.
+
+Outputs `daily_model_data.parquet`.
+
+---
+
+# Load Clean Drivers
+
+```{r load-data}
+obs <- read_parquet(
+  here("data/derived/models/turbidity_forecast/daily_obs_drivers_clean.parquet")
+)
+
+cat("Rows:", nrow(obs), "\n")
+cat("Date range:", as.character(range(obs$date)), "\n")
+glimpse(obs)
+```
+
+---
+
+# Flow Features
+
+```{r flow-features}
+# antecedent_Q_maker() defined in 00_functions.Rmd
+model_data <- antecedent_Q_maker(obs)
+
+cat("Flow feature columns added:\n")
+cat(setdiff(names(model_data), names(obs)), "\n")
+```
+
+---
+
+# Snow / Melt Features
+
+```{r snow-features}
+# melt_rate_calculator() defined in 00_functions.Rmd
+model_data <- melt_rate_calculator(model_data)
+
+cat("NA melt_rate_7d:", sum(is.na(model_data$melt_rate_7d)),
+    "— expected for first 7 rows and any SNOTEL gaps\n")
+```
+
+---
+
+# Precipitation Features
+
+```{r precip-features}
+model_data <- model_data %>%
+  arrange(date) %>%
+  mutate(
+    # Treat NA precipitation as 0 (trace / missing = no event assumed)
+    precip        = replace_na(redfeather_precip_in, 0),
+
+    precip_3day   = slide_dbl(precip, sum, .before = 2, .complete = TRUE),
+    precip_7day   = slide_dbl(precip, sum, .before = 6, .complete = TRUE),
+
+    precip_event  = as.integer(precip > PRECIP_THRESH)
+  )
+```
+
+---
+
+# Temperature Interaction Feature (2018+ only)
+
+```{r temp-features}
+# 5-day rolling mean Tmax and SWE × Tmax interaction term
+# These columns will be NA before 2018-06-27; LightGBM handles NA natively.
+# Exclude from GAM formulas or restrict to 2018+ when fitting GAMs with temp terms.
+
+model_data <- model_data %>%
+  arrange(date) %>%
+  mutate(
+    tmax_5d_mean = slide_dbl(tmax_c, mean, .before = 4, .complete = TRUE),
+    swe_x_tmax   = swe_pc1 * tmax_5d_mean
+  )
+```
+
+---
+
+# Regime Classification
+
+```{r regime-classification}
+# regime_classifier() defined in 00_functions.Rmd
+model_data <- regime_classifier(model_data)
+
+# Check distribution
+model_data %>%
+  filter(year %in% 2010:2023) %>%
+  count(regime) %>%
+  mutate(pct = round(100 * n / sum(n), 1))
+```
+
+---
+
+# Lead Targets (t+1, t+2, t+3)
+
+```{r lead-targets}
+model_data <- model_data %>%
+  arrange(date) %>%
+  mutate(
+    target_p95_t1 = lead(p95, 1),
+    target_p95_t2 = lead(p95, 2),
+    target_p95_t3 = lead(p95, 3)
+  )
+```
+
+---
+
+# Verify Completeness
+
+```{r completeness}
+# Columns required to fit any model (GAM-safe subset — excludes temp interaction)
+MODEL_COLS <- c("p95", "log_q", "deltaQ_24h",
+                "precip_3day", "precip_event",
+                "melt_rate_7d", "doy", "regime")
+
+TARGET_COLS <- c("target_p95_t1", "target_p95_t2", "target_p95_t3")
+
+cat("Complete rows (MODEL_COLS + t+1 target):",
+    sum(complete.cases(model_data[, c(MODEL_COLS, "target_p95_t1")])),
+    "of", nrow(model_data), "\n")
+
+# Regime distribution for training years only
+model_data %>%
+  filter(year %in% 2010:2023,
+         complete.cases(.[, c(MODEL_COLS, "target_p95_t1")])) %>%
+  count(regime) %>%
+  mutate(pct = round(100 * n / sum(n), 1))
+```
+
+---
+
+# Regime Visualisation
+
+```{r regime-ts, fig.dim = c(12, 4)}
+model_data %>%
+  filter(year %in% 2010:2023,
+         complete.cases(.[, c(MODEL_COLS, "target_p95_t1")])) %>%
+  ggplot(aes(x = date, y = p95, color = regime)) +
+  geom_point(size = 0.4, alpha = 0.6) +
+  scale_color_manual(
+    values = c(snowmelt = "#2166ac", convective = "#d73027", baseflow = "#4dac26")
+  ) +
+  scale_y_continuous(limits = c(0, NA)) +
+  theme_bw() +
+  labs(title = "Observed daily p95 turbidity coloured by regime (2010–2023)",
+       x = NULL, y = "p95 turbidity (NTU)")
+```
+
+```{r regime-boxplot, fig.dim = c(6, 5)}
+model_data %>%
+  filter(year %in% 2010:2023,
+         complete.cases(.[, c(MODEL_COLS, "target_p95_t1")])) %>%
+  ggplot(aes(x = regime, y = p95, fill = regime)) +
+  geom_boxplot(outlier.size = 0.5) +
+  scale_fill_manual(
+    values = c(snowmelt = "#2166ac", convective = "#d73027", baseflow = "#4dac26")
+  ) +
+  scale_y_log10() +
+  theme_bw() +
+  theme(legend.position = "none") +
+  labs(title = "Daily p95 turbidity by regime (log scale)", x = NULL, y = "NTU (log)")
+```
+
+---
+
+# Antecedent Flow — Seasonal Profile
+
+```{r antecedent-profile, fig.dim = c(10, 4)}
+# Visualise seasonal pattern of key antecedent features
+model_data %>%
+  filter(year %in% 2010:2023) %>%
+  group_by(doy) %>%
+  summarise(
+    median_q       = median(canyon_mouth_cfs, na.rm = TRUE),
+    median_melt7d  = median(melt_rate_7d,     na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(cols = c(median_q, median_melt7d),
+               names_to = "variable", values_to = "value") %>%
+  ggplot(aes(x = doy, y = value)) +
+  geom_line() +
+  facet_wrap(~ variable, scales = "free_y") +
+  theme_bw() +
+  labs(title = "Median seasonal profiles — discharge and melt rate (2010–2023)",
+       x = "Day of year", y = NULL)
+```
+
+---
+
+# Save
+
+```{r save}
+out_dir <- here("data/derived/models/turbidity_forecast")
+write_parquet(model_data,
+              file.path(out_dir, "daily_model_data.parquet"))
+
+cat("Saved:", file.path(out_dir, "daily_model_data.parquet"), "\n")
+cat("Columns:", paste(names(model_data), collapse = ", "), "\n")
+```

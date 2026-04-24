@@ -1,0 +1,205 @@
+---
+title: "07_forecast_data_prep — Daily p95 Turbidity Forecast (Modified Kemper)"
+author: "ROSSyndicate"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+library(here)
+library(tidyverse)
+library(lubridate)
+library(slider)
+library(arrow)
+
+source(knitr::purl(here("modeling/turbidity/modified_kemper_application_daily/00_functions.Rmd"),
+                   quiet = TRUE))
+```
+
+# Purpose
+
+Prepare the HEFS ensemble forecast data as predictor features for the
+turbidity models. For each forecast initialization date, this script:
+
+1. Uses **observed** flow, SWE, and precipitation up to and including the
+   initialization date for antecedent features (lookback window).
+2. Substitutes **HEFS ensemble mean flow** for the forecast date(s) as the
+   current-day flow predictor.
+3. Computes regime classification using observed conditions at initialization.
+4. Outputs one row per `init_date × lead_days`, with all features needed
+   for `08_make_forecasts.Rmd`.
+
+Analogous to `kemper_turb_method/07_forecast_data_prep.Rmd` but adapted for
+daily resolution and the addition of snow/melt features.
+
+---
+
+# Load Data
+
+```{r load-data}
+# Observed historical features (from 03_feature_engineering.Rmd)
+model_data <- read_parquet(
+  here("data/derived/models/turbidity_forecast/daily_model_data.parquet")
+)
+
+# HEFS ensemble summary (from 06_forecast_data_download.Rmd)
+hefs_summary <- read_parquet(
+  here("data/derived/models/turbidity_forecast/hefs_forecasts_summary.parquet")
+)
+
+cat("Model data rows:", nrow(model_data), "\n")
+cat("HEFS summary rows:", nrow(hefs_summary), "\n")
+cat("HEFS init_date range:", as.character(range(hefs_summary$init_date)), "\n")
+```
+
+---
+
+# Build Antecedent Context at Each Initialization Date
+
+For each init_date, we need the observed antecedent flow history to compute
+rolling means, maxima, and time-since-peak features. We also need the current
+(init_date) observed SWE, precip, and regime classification.
+
+```{r antecedent-context}
+# All unique initialization dates in the HEFS archive
+init_dates <- sort(unique(hefs_summary$init_date))
+cat("Initialisation dates:", length(init_dates), "\n")
+
+# For each init_date, extract the row from model_data that corresponds to
+# conditions at that date (antecedent features are already computed there)
+init_context <- model_data %>%
+  filter(date %in% init_dates) %>%
+  select(
+    date,
+    # Current observed flow and state
+    canyon_mouth_cfs, log_q, log_q_sq,
+    # Antecedent flow features
+    mean_q_7d, mean_q_30d, mean_q_90d,
+    max_q_30d, max_q_90d, max_q_365d,
+    time_since_30d_peak, time_since_90d_peak, time_since_annual_peak,
+    log_limb,
+    # Snow features
+    swe_pc1, melt_rate_7d, melt_rate_14d,
+    # Precipitation features
+    precip, precip_3day, precip_7day, precip_event,
+    # Temperature features (NA before 2018)
+    tmax_c, tmax_5d_mean, swe_x_tmax,
+    # Temporal
+    doy, year,
+    # Regime at init date
+    regime,
+    # Today's observed p95 (used for persistence baseline)
+    p95
+  ) %>%
+  rename(init_date = date)
+```
+
+---
+
+# Merge HEFS Flow with Init Context
+
+For each lead day, replace `canyon_mouth_cfs` and `log_q` with the HEFS
+ensemble mean forecast flow (the primary forecast driver), while keeping
+all antecedent features from the initialization date.
+
+The HEFS spread (`hefs_spread`) is retained as an additional predictor
+capturing forecast uncertainty.
+
+```{r merge-hefs-features}
+hefs_features <- hefs_summary %>%
+  filter(lead_days %in% 1:3) %>%
+  left_join(init_context, by = "init_date") %>%
+  mutate(
+    # Override current-day flow features with HEFS-forecast values
+    canyon_mouth_cfs_forecast = hefs_mean_cfs,
+    log_q_forecast            = log1p(hefs_mean_cfs),
+    log_q_sq_forecast         = log_q_forecast^2,
+
+    # Approximate deltaQ: HEFS forecast minus last observed (at init_date)
+    deltaQ_24h_forecast       = hefs_mean_cfs - canyon_mouth_cfs,
+    deltaQ_48h_forecast       = case_when(
+      lead_days == 1 ~ hefs_mean_cfs - canyon_mouth_cfs,
+      lead_days >= 2 ~ hefs_mean_cfs -
+        lag(hefs_mean_cfs, 1, default = NA_real_),
+      .default = NA_real_
+    ),
+
+    # Log-limb: change in log-Q from init to forecast date
+    log_limb_forecast = log_q_forecast - log_q,
+
+    # dq_q: normalised flow change
+    dq_q_forecast = (hefs_mean_cfs - canyon_mouth_cfs) / canyon_mouth_cfs
+  ) %>%
+  # Rename forecast-day flow features for clarity downstream
+  rename(
+    log_q_obs      = log_q,       # observed at init
+    log_q          = log_q_forecast,  # HEFS-forecast (used as model input)
+    log_q_sq       = log_q_sq_forecast,
+    deltaQ_24h     = deltaQ_24h_forecast,
+    deltaQ_48h     = deltaQ_48h_forecast,
+    log_limb       = log_limb_forecast,
+    dq_q           = dq_q_forecast
+  )
+
+cat("HEFS feature rows:", nrow(hefs_features), "\n")
+cat("Lead days:", sort(unique(hefs_features$lead_days)), "\n")
+```
+
+---
+
+# Verify Completeness
+
+```{r completeness}
+FORECAST_MODEL_COLS <- c("log_q", "deltaQ_24h", "melt_rate_7d",
+                         "swe_pc1", "precip_3day", "precip_event",
+                         "mean_q_7d", "mean_q_30d",
+                         "doy", "regime")
+
+hefs_features %>%
+  summarise(across(all_of(FORECAST_MODEL_COLS),
+                   ~ sum(is.na(.)), .names = "na_{.col}")) %>%
+  pivot_longer(everything(), names_to = "col", values_to = "n_na") %>%
+  filter(n_na > 0) %>%
+  mutate(pct_na = round(100 * n_na / nrow(hefs_features), 1)) %>%
+  arrange(desc(n_na))
+```
+
+---
+
+# Spot-Check: HEFS vs. Observed Flow
+
+```{r spot-check, fig.dim = c(12, 4)}
+spot <- hefs_features %>%
+  filter(lead_days == 1) %>%
+  left_join(
+    model_data %>%
+      select(date, observed_cfs = canyon_mouth_cfs),
+    by = c("forecast_date" = "date")
+  )
+
+spot %>%
+  pivot_longer(cols = c(canyon_mouth_cfs_forecast, observed_cfs),
+               names_to = "series", values_to = "cfs") %>%
+  ggplot(aes(x = forecast_date, y = cfs, color = series)) +
+  geom_line(linewidth = 0.5, alpha = 0.8) +
+  scale_color_manual(
+    values = c(canyon_mouth_cfs_forecast = "steelblue", observed_cfs = "black")
+  ) +
+  scale_y_log10() +
+  theme_bw() +
+  labs(title = "HEFS 1-day forecast vs. observed Canyon Mouth flow",
+       x = NULL, y = "CFS (log scale)", color = NULL)
+```
+
+---
+
+# Save
+
+```{r save}
+out_path <- here("data/derived/models/turbidity_forecast/hefs_forecast_features.parquet")
+write_parquet(hefs_features, out_path)
+cat("Saved:", out_path, "\n")
+cat("Columns:", paste(names(hefs_features), collapse = ", "), "\n")
+```

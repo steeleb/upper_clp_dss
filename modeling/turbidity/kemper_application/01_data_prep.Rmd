@@ -1,0 +1,607 @@
+---
+title: "01_data_prep — FC Intake Turbidity (Kemper Method)"
+author: "ROSSyndicate"
+date: "`r Sys.Date()`"
+output: html
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Purpose
+
+This script loads and prepares the Fort Collins Intake turbidity and Canyon
+Mouth discharge data for application of the Kemper et al. (2025) turbidity
+forecasting method.
+
+Adaptations from the original Kemper workflow:
+- Turbidity comes from a local SCADA CSV (15-min, FNU) rather than USGS NWIS.
+- Discharge comes from CDSSR `get_telemetry_ts()` at hourly resolution, enabling
+the flow-weighted turbidity aggregation used in Kemper et al.
+- There is a single flow station (no upstream tributary network).
+- No probe-to-probe correction is needed (single sensor type).
+- No tunnel-flow filter is applied.
+
+Output: `intake_turbidity_plus_drivers_clean` — hourly modeling dataset with
+flow-weighted turbidity and antecedent discharge features.
+
+
+### Packages
+
+```{r packages}
+library(here)
+library(tidyverse)
+library(lubridate)
+library(tsibble)
+library(zoo)
+library(slider)
+library(cdssr)
+library(arrow)
+```
+
+# Load Data
+
+## Turbidity — FC Intake (15-min SCADA CSV)
+```{r load-turbidity}
+#### The raw file has a wide layout with many empty columns.
+#### Only the first two columns are used:
+####   col 1 — SampleDatetime  (format: YYYYMMdd HHMM, trailing space)
+####   col 2 — N311            (turbidity, FNU)
+
+raw_turb <- read_csv(
+  here("data/raw/fc_intake_data/Intake_Turbidity_2010-2025.csv"),
+  col_names = TRUE,
+  col_select = 1:2,
+  col_types = cols(.default = col_character()),
+  show_col_types = FALSE
+) %>%
+  rename(raw_datetime = 1,
+         turbidity_fnu = 2) %>%
+  mutate(
+    raw_datetime = str_trim(raw_datetime),
+    dateTime = parse_date_time(raw_datetime,
+                               orders = "Ymd HM",
+                               tz = "America/Denver"),
+    turbidity_fnu = as.numeric(turbidity_fnu)
+  ) %>%
+  filter(!is.na(dateTime),
+         !is.na(turbidity_fnu),
+         turbidity_fnu >= 0) %>%
+  select(dateTime, turbidity_fnu)
+
+glimpse(raw_turb)
+```
+
+## Discharge — Canyon Mouth (CLAFTCCO, CDSSR, hourly telemetry)
+
+```{r load-flow}
+#### get_telemetry_ts with timescale = "hour" returns observed hourly discharge
+#### directly from the CDSSR telemetry network, eliminating the need for
+#### interpolation from daily values.
+#### Returns columns including `datetime` and `value` (cfs).
+#### Gaps of ≤ 24 h are filled by linear interpolation.
+
+flow_raw <- get_telemetry_ts(
+  abbrev = "CLAFTCCO",
+  parameter = "DISCHRG",
+  start_date = "2010-01-01",
+  end_date = "2025-12-31",
+  timescale = "hour"
+)
+
+## TO-DO: need to deal with flags here
+
+flow_hourly <- flow_raw %>%
+  select(dateTime = datetime, flow_cfs = meas_value) %>%
+  mutate(dateTime = as.POSIXct(dateTime, tz = "America/Denver")) %>%
+  arrange(dateTime) %>%
+  as_tsibble(index = "dateTime") %>%
+  fill_gaps(.full = FALSE) %>%
+  mutate(
+    flow_cfs = na.approx(flow_cfs, maxgap = 24, na.rm = FALSE),
+    flow_cms = pmax(flow_cfs * 0.0283168, 0.001) # cfs → cms; guard against zero
+  ) %>%
+  as_tibble() %>%
+  mutate(
+    log_observed_flow = log10(flow_cms),
+    log_squared_observed_flow = log_observed_flow^2
+  ) %>%
+  filter(!is.na(flow_cms))
+
+glimpse(flow_hourly)
+```
+
+# Turbidity QC
+
+## Turbidity — Munroe (upstream reference, 15-min SCADA CSV)
+
+```{r load-munroe}
+#### Same wide-CSV layout as the intake file; only cols 1–2 are used.
+#### Column 2 (N4118) is turbidity in FNU at the Munroe site, which is
+#### slightly upstream of the FC Intake sensor.
+
+munroe_raw <- read_csv(
+  here("data/raw/fc_intake_data/Munroe_Turbidity_2013-2025.csv"),
+  col_names = TRUE,
+  col_select = 1:2,
+  col_types = cols(.default = col_character()),
+  show_col_types = FALSE
+) %>%
+  rename(raw_datetime = 1,
+         munroe_fnu   = 2) %>%
+  mutate(
+    raw_datetime = str_trim(raw_datetime),
+    dateTime     = parse_date_time(raw_datetime,
+                                   orders = "Ymd HM",
+                                   tz     = "America/Denver"),
+    munroe_fnu   = as.numeric(munroe_fnu)
+  ) %>%
+  filter(!is.na(dateTime), !is.na(munroe_fnu), munroe_fnu >= 0) %>%
+  select(dateTime, munroe_fnu)
+
+glimpse(munroe_raw)
+```
+
+```{r munroe-lag-plot, fig.width = 12, fig.height = 5}
+#### First-pass outlier check: aggregate both sensors to hourly means,
+#### then lag Munroe by 1 h (travel time from Munroe → Intake).
+#### Points where the intake sensor departs strongly from the Munroe
+#### signal shifted forward 1 h are candidate outliers.
+
+intake_hourly_raw <- raw_turb %>%
+  mutate(hour_dt = floor_date(dateTime, "hour")) %>%
+  summarise(intake_fnu = mean(turbidity_fnu, na.rm = TRUE),
+            .by = hour_dt)
+
+munroe_hourly <- munroe_raw %>%
+  mutate(hour_dt = floor_date(dateTime, "hour")) %>%
+  summarise(munroe_fnu = mean(munroe_fnu, na.rm = TRUE),
+            .by = hour_dt) %>%
+  mutate(hour_dt_lagged = hour_dt - hours(1))   # shift upstream → downstream
+
+lag_joined <- intake_hourly_raw %>%
+  inner_join(munroe_hourly %>% select(hour_dt_lagged, munroe_fnu),
+             by = c("hour_dt" = "hour_dt_lagged"))
+
+#### Time-series overlay
+lag_joined %>%
+  pivot_longer(c(intake_fnu, munroe_fnu),
+               names_to = "sensor", values_to = "fnu") %>%
+  mutate(sensor = recode(sensor,
+                         intake_fnu = "FC Intake",
+                         munroe_fnu = "Munroe (lag +1 h)")) %>%
+  ggplot(aes(x = hour_dt, y = fnu, color = sensor)) +
+  geom_line(linewidth = 0.25, alpha = 0.7) +
+  scale_y_log10() +
+  scale_color_manual(values = c("FC Intake" = "steelblue",
+                                "Munroe (lag +1 h)" = "darkorange")) +
+  labs(title = "Cross-sensor comparison — FC Intake vs. Munroe (1-h lag, log scale)",
+       subtitle = "Divergences suggest candidate outliers in the intake record",
+       x = NULL, y = "FNU", color = NULL) +
+  theme_bw() +
+  theme(legend.position = "top")
+
+#### Scatter: Munroe (lag +1 h) vs. Intake — points far from the 1:1 line are suspects
+lag_joined %>%
+  ggplot(aes(x = munroe_fnu, y = intake_fnu)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50") +
+  geom_point(alpha = 0.15, size = 0.7, color = "steelblue") +
+  scale_x_log10() +
+  scale_y_log10() +
+  labs(title = "Scatter: Munroe (lag +1 h) vs. FC Intake turbidity",
+       subtitle = "Dashed line = 1:1; outliers appear above or below",
+       x = "Munroe FNU (lagged 1 h)", y = "FC Intake FNU") +
+  theme_bw()
+```
+
+---
+
+```{r turb-qc-params}
+#### Tunable QC thresholds — adjust after reviewing diagnostics below.
+####
+####   STUCK_MIN_RUN      — flag runs of ≥ N consecutive identical values
+####                         (sensor offline returning last-known value)
+####   SPIKE_ROC_THRESHOLD — flag if |Δturb| / prior value exceeds this ratio
+####                         (e.g. 10 = 1000% change in a single 15-min step)
+
+STUCK_MIN_RUN       <- 10
+SPIKE_ROC_THRESHOLD <- 10
+```
+
+```{r turb-qc-diagnostic, fig.width = 12, fig.height = 4}
+#### Full raw record — use this to spot gross anomalies before flagging.
+map(year(raw_turb$dateTime), 
+    ~ raw_turb %>%
+      filter(year(dateTime) == .x) %>% 
+      ggplot(aes(x = dateTime, y = turbidity_fnu)) +
+      geom_line(linewidth = 0.2, alpha = 0.5, color = "steelblue") +
+      scale_y_log10() +
+      labs(title = "Raw 15-min Turbidity — full record (log scale)",
+           x = NULL, y = "FNU") +
+      theme_bw()
+)
+```
+
+```{r turb-qc-flag}
+#### Flag 1 — Stuck sensor: ≥ STUCK_MIN_RUN consecutive identical values.
+#### This is the SCADA analog of Kemper's provisional-data filter:
+#### sensors that drop offline typically latch onto their last valid reading.
+
+raw_turb_flagged <- raw_turb %>%
+  arrange(dateTime) %>%
+  mutate(
+    rl_id  = with(rle(turbidity_fnu), rep(seq_along(lengths), lengths)),
+    rl_len = with(rle(turbidity_fnu), rep(lengths, lengths)),
+    stuck  = rl_len >= STUCK_MIN_RUN
+  ) %>%
+  select(-rl_id, -rl_len)
+
+#### Flag 2 — Spike: single-step rate of change exceeds threshold.
+#### Retains genuine rapid storm rises (which are gradual across steps)
+#### while catching instantaneous jumps caused by sensor fouling or
+#### debris impacts.
+
+raw_turb_flagged <- raw_turb_flagged %>%
+  mutate(
+    roc   = abs(turbidity_fnu - lag(turbidity_fnu)) / lag(turbidity_fnu),
+    spike = !is.na(roc) & roc > SPIKE_ROC_THRESHOLD
+  ) %>%
+  select(-roc)
+
+cat("Stuck-sensor flags :", sum(raw_turb_flagged$stuck,            na.rm = TRUE), "\n")
+cat("Spike flags        :", sum(raw_turb_flagged$spike,            na.rm = TRUE), "\n")
+cat("Total flagged      :", sum(raw_turb_flagged$stuck |
+                                  raw_turb_flagged$spike, na.rm = TRUE), "\n")
+cat("Total observations :", nrow(raw_turb_flagged), "\n")
+```
+
+```{r turb-qc-inspect, fig.width = 12, fig.height = 4}
+#### Plot flagged observations over the full record to review before removing.
+map(year(raw_turb_flagged$dateTime), 
+    ~ raw_turb_flagged %>%
+      filter(year(dateTime) == .x) %>% 
+      mutate(flag = case_when(
+        stuck & spike ~ "both",
+        stuck         ~ "stuck",
+        spike         ~ "spike",
+        TRUE          ~ "ok"
+      )) %>%
+      ggplot(aes(x = dateTime, y = turbidity_fnu)) +
+      geom_line(data = ~ filter(., flag == "ok"),
+                linewidth = 0.2, alpha = 0.4, color = "steelblue") +
+      geom_point(data = ~ filter(., flag != "ok"),
+                 aes(color = flag), size = 1, alpha = 0.8) +
+      scale_color_manual(values = c(stuck = "goldenrod3",
+                                    spike = "firebrick",
+                                    both  = "purple"),
+                         name = "Flag") +
+      #scale_y_log10() +
+      labs(title = "Flagged turbidity observations",
+           subtitle = paste0("stuck threshold: ", STUCK_MIN_RUN,
+                             " consecutive identical values  |  ",
+                             "spike threshold: ROC > ", SPIKE_ROC_THRESHOLD, "×"),
+           x = NULL, y = "FNU") +
+      theme_bw()
+)
+```
+
+```{r turb-qc-clean}
+#### Remove flagged observations.
+#### Downstream, the flow-weighted aggregation step's na.approx() call will
+#### interpolate across resulting gaps of ≤ 24 h (same as Kemper).
+
+raw_turb_clean <- raw_turb_flagged %>%
+  filter(!(stuck | spike)) %>%
+  select(dateTime, turbidity_fnu)
+
+cat("Removed :", nrow(raw_turb) - nrow(raw_turb_clean), "observations\n")
+cat("Retained:", nrow(raw_turb_clean), "observations\n")
+```
+
+---
+
+# Flow-Weighted Turbidity Aggregation (15-min → hourly)
+
+```{r fw-aggregation}
+
+################################################################################
+#### This replicates the Kemper et al. approach:
+####   1. Join instantaneous (15-min) turbidity to the hourly discharge record.
+####      Each 15-min reading is assigned the flow of its containing hour.
+####   2. Compute turbidity flux = turbidity × flow_cms.
+####   3. Integrate flux and water volume over each hour using the time step
+####      implied by observations per hour (1, 2, 3, or 4 per hour).
+####   4. Flow-weighted mean = Σ(turbidity_load) / Σ(water_load) per hour.
+####   5. Fill gaps ≤ 24 h by linear interpolation; log-transform.
+################################################################################
+
+#### Assign each 15-min turbidity reading the interpolated hourly flow value
+#### by flooring the 15-min timestamp to the hour.
+
+turb_with_flow <- raw_turb_clean %>%
+  mutate(hour_dt = floor_date(dateTime, unit = "hour")) %>%
+  inner_join(flow_hourly %>% 
+               select(dateTime, flow_cms),
+             by = c("hour_dt" = "dateTime")) %>%
+  mutate(
+    date = date(dateTime),
+    hour = hour(dateTime)
+  )
+
+#### Count observations per hour (needed for correct time-step weighting)
+
+turb_obs_per_hour <- turb_with_flow %>%
+  mutate(obs_per_hour = n(),
+         .by = c(date,hour)) 
+
+#### Compute turbidity flux and water load for each 15-min observation
+
+turb_flux <- turb_obs_per_hour %>%
+  mutate(
+    turbidity_flux = turbidity_fnu * flow_cms,
+    turbidity_load = case_when(
+      obs_per_hour == 4 ~ turbidity_flux * 60 * 15,
+      obs_per_hour == 3 ~ turbidity_flux * 60 * 20,
+      obs_per_hour == 2 ~ turbidity_flux * 60 * 30,
+      obs_per_hour == 1 ~ turbidity_flux * 60 * 60
+    ),
+    water_load = case_when(
+      obs_per_hour == 4 ~ flow_cms * 60 * 15,
+      obs_per_hour == 3 ~ flow_cms * 60 * 20,
+      obs_per_hour == 2 ~ flow_cms * 60 * 30,
+      obs_per_hour == 1 ~ flow_cms * 60 * 60
+    )
+  )
+
+#### Aggregate to hourly flow-weighted mean turbidity
+
+hourly_turbidity <- turb_flux %>%
+  summarise(
+    dateTime = floor_date(dateTime[1], unit = "hour"),
+    fw_mean_observed_turbidity = sum(turbidity_load) / sum(water_load),
+    .by = c(date, hour)
+  ) %>%
+  ### Rebuild as a regular hourly tsibble and fill short gaps
+  as_tsibble(index = "dateTime") %>%
+  fill_gaps(.full = FALSE) %>%
+  mutate(
+    fw_mean_observed_turbidity = na.approx(fw_mean_observed_turbidity, 
+                                           maxgap = 24, 
+                                           na.rm = FALSE)
+  ) %>%
+  as_tibble() %>%
+  mutate(
+    log_observed_turbidity = log10(fw_mean_observed_turbidity)
+  ) %>%
+  filter(!is.na(fw_mean_observed_turbidity))
+
+glimpse(hourly_turbidity)
+```
+
+
+# Merge Turbidity and Discharge
+
+```{r merge}
+#### Join flow-weighted hourly turbidity with the hourly interpolated flow.
+
+hourly_merged <- hourly_turbidity %>%
+  inner_join(., flow_hourly) %>%
+  mutate(
+    date = date(dateTime),
+    hour = hour(dateTime),
+    water_year = if_else(month(dateTime) >= 10,
+                         year(dateTime) + 1L,
+                         year(dateTime))
+  ) %>%
+  arrange(dateTime)
+
+glimpse(hourly_merged)
+```
+
+---
+
+# Calculate Antecedent Discharge Features
+
+```{r antecedent-short}
+
+################################################################################
+#### Antecedent discharge features — short to medium term.
+#### Window sizes are in hours, matching the Kemper et al. convention:
+####
+####   six_hour_lag_log_q         mean of prior 6 h
+####   mean_prior_daily_log_q     mean of prior 24 h
+####   mean_prior_weekly_log_q    mean of prior 168 h (7 days)
+####   mean_prior_monthly_log_q   mean of prior 720 h (30 days)
+####   max_prior_monthly_log_q    max  of prior 720 h
+####   log_limb                   log(Q_t) − log(Q_{t-1})
+####   dq_q                       log_limb / log(Q_t)
+################################################################################
+
+expanded_discharge <- hourly_merged %>%
+  arrange(dateTime) %>%
+  mutate(
+    six_hour_lag_log_q = rollapply(log_observed_flow,
+                                   width = list(-(6:1)), mean,
+                                   align = "right", fill = NA),
+    
+    mean_prior_daily_log_q = rollapply(log_observed_flow,
+                                       width = list(-(24:1)), mean,
+                                       align = "right", fill = NA),
+    
+    mean_prior_weekly_log_q = rollapply(log_observed_flow,
+                                        width = list(-((24*7):1)), mean,
+                                        align = "right", fill = NA),
+    
+    mean_prior_monthly_log_q = rollapply(log_observed_flow,
+                                         width = list(-((24*30):1)), mean,
+                                         align = "right", fill = NA),
+    
+    max_prior_monthly_log_q = rollapply(log_observed_flow,
+                                        width = list(-((24*30):1)), max,
+                                        align = "right", fill = NA),
+    
+    log_limb = log_observed_flow - lag(log_observed_flow),
+    dq_q = log_limb / log_observed_flow
+  )
+```
+
+```{r antecedent-long}
+
+################################################################################
+#### Antecedent discharge features — long term.
+#### These require larger rolling windows and take more time to compute.
+################################################################################
+
+expanded_discharge_long <- expanded_discharge %>%
+  arrange(dateTime) %>%
+  mutate(
+    max_prior_threemonth_log_q = rollapply(log_observed_flow,
+                                           width = list(-((24*30*3):1)), max,
+                                           align = "right", fill = NA),
+    
+    max_prior_sixmonth_log_q = rollapply(log_observed_flow,
+                                         width = list(-((24*30*6):1)), max,
+                                         align = "right", fill = NA)
+  ) %>%
+  mutate(
+    date_3month_max = slide2(
+      log_observed_flow, dateTime,
+      .f = ~ as_datetime(.y[which.max(.x)]),
+      .before = (24*30*3), .complete = FALSE
+    ) %>% map_dbl(as.numeric) %>% as_datetime(tz = "America/Denver"),
+    
+    date_6month_max = slide2(
+      log_observed_flow, dateTime,
+      .f = ~ as_datetime(.y[which.max(.x)]),
+      .before = (24*30*6), .complete = FALSE
+    ) %>% map_dbl(as.numeric) %>% as_datetime(tz = "America/Denver")
+  )
+```
+
+```{r antecedent-annual}
+
+################################################################################
+#### Annual antecedent — this is the most time-consuming window.
+################################################################################
+
+annual_expanded_discharge <- expanded_discharge_long %>%
+  mutate(
+    max_prior_annual_q = rollapply(log_observed_flow,
+                                   width = list(-((24*365):1)), max,
+                                   align = "right", fill = NA)
+  ) %>%
+  mutate(
+    date_year_max = slide2(
+      log_observed_flow, dateTime,
+      .f = ~ as_datetime(.y[which.max(.x)]),
+      .before = (24*365), .complete = FALSE
+    ) %>% map_dbl(as.numeric) %>% as_datetime(tz = "America/Denver")
+  )
+```
+
+```{r peak-timing}
+
+#### Time since the 3-month, 6-month, and annual discharge peaks (hours)
+
+longer_term_expanded_discharge <- annual_expanded_discharge %>%
+  mutate(
+    time_since_3month_peak = abs(difftime(date_3month_max, dateTime, units = "hours")),
+    time_since_6month_peak = abs(difftime(date_6month_max, dateTime, units = "hours")),
+    time_since_annual_peak = abs(difftime(date_year_max, dateTime, units = "hours"))
+  ) %>%
+  select(
+    -date_3month_max, -date_6month_max, -date_year_max
+  )
+```
+
+
+# Finalize Modeling Dataset
+
+```{r final-dataset}
+
+################################################################################
+#### Assemble the final modeling dataset, add DOY and water year, drop NA rows.
+################################################################################
+
+intake_turbidity_plus_drivers_clean <- longer_term_expanded_discharge %>%
+  mutate(
+    doy = yday(dateTime),
+    month = month(dateTime),
+    water_year = as.integer(water_year)
+  ) %>%
+  select(
+    dateTime, date, hour, doy, month, water_year,
+    fw_mean_observed_turbidity,
+    log_observed_turbidity,
+    flow_cms,
+    log_observed_flow,
+    log_squared_observed_flow,
+    six_hour_lag_log_q,
+    mean_prior_daily_log_q,
+    mean_prior_weekly_log_q,
+    mean_prior_monthly_log_q,
+    max_prior_monthly_log_q,
+    max_prior_threemonth_log_q,
+    max_prior_sixmonth_log_q,
+    max_prior_annual_q,
+    log_limb, dq_q,
+    time_since_3month_peak,
+    time_since_6month_peak,
+    time_since_annual_peak
+  ) %>%
+  drop_na()
+
+cat("Final modeling dataset:", nrow(intake_turbidity_plus_drivers_clean),
+    "rows,", ncol(intake_turbidity_plus_drivers_clean), "columns\n")
+cat("Date range:",
+    as.character(min(intake_turbidity_plus_drivers_clean$dateTime)), "to",
+    as.character(max(intake_turbidity_plus_drivers_clean$dateTime)), "\n")
+cat("Water years:",
+    min(intake_turbidity_plus_drivers_clean$water_year), "to",
+    max(intake_turbidity_plus_drivers_clean$water_year), "\n")
+
+glimpse(intake_turbidity_plus_drivers_clean)
+```
+
+
+# Quick Diagnostic Plots
+
+```{r plot-ts, fig.width=12, fig.height=4}
+
+#### Hourly time series of flow-weighted turbidity
+
+intake_turbidity_plus_drivers_clean %>%
+  ggplot(aes(x = dateTime, y = fw_mean_observed_turbidity)) +
+  geom_line(color = "steelblue", linewidth = 0.2, alpha = 0.6) +
+  scale_y_log10() +
+  labs(title = "FC Intake — Hourly Flow-Weighted Turbidity (log scale)",
+       x = NULL, y = "Turbidity (FNU)") +
+  theme_bw()
+```
+
+```{r plot-rating, fig.width=6, fig.height=5}
+
+#### Rating curve: log(Q) vs. log(turbidity)
+
+intake_turbidity_plus_drivers_clean %>%
+  ggplot(aes(x = log_observed_flow, y = log_observed_turbidity)) +
+  geom_point(alpha = 0.1, size = 0.5, color = "steelblue") +
+  geom_smooth(method = "lm", formula = y ~ poly(x, 2),
+              color = "firebrick", se = TRUE) +
+  labs(title = "Rating Curve — Canyon Mouth Q vs. FC Intake Turbidity",
+       x = "log10(Q, m³/s)", y = "log10(Turbidity, FNU)") +
+  theme_bw()
+```
+
+
+# Save data
+
+```{r}
+write_parquet(intake_turbidity_plus_drivers_clean, here(
+  paste0("data/derived/models/turbidity_forecast/intake_turbidity_plus_drivers_clean_v", 
+         Sys.Date(), ".parquet")
+))
+```
+
+

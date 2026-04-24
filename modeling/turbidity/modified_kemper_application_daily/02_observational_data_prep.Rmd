@@ -1,0 +1,242 @@
+---
+title: "02_observational_data_prep — Daily p95 Turbidity Forecast (Modified Kemper)"
+author: "ROSSyndicate"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+library(here)
+library(tidyverse)
+library(lubridate)
+library(snotelr)
+library(cdssr)
+library(arrow)
+library(RcppRoll)
+```
+
+# Purpose
+
+Download and clean all observational data used as predictors. Outputs a single
+clean parquet file (`daily_obs_drivers_clean.parquet`) that is the starting
+point for `03_feature_engineering.Rmd`.
+
+Adaptations from the original Kemper `02_observational_data_download_and_clean.Rmd`:
+- Target is daily p95 turbidity (NTU) from a pre-computed CSV — no sub-hourly
+  aggregation or probe-conversion is required.
+- Discharge is daily CFS from CDSSR (single station; no tributary network).
+- Snow/melt and temperature predictors are added for the CLP environment.
+- No tunnel-flow correction is applied.
+
+---
+
+# 1. Turbidity Target — FC Intake
+
+```{r load-turbidity}
+turb <- read_csv(
+  here("data/collated/FC_intake/fc_intake_munroe_turbidity_quantile_record_2010-2025.csv"),
+  show_col_types = FALSE
+) %>%
+  filter(location == "intake_turb_NTU") %>%
+  mutate(date = as.Date(date)) %>%
+  select(date, doy, year, p05, p25, p50, p75, p95, n_obs = n)
+
+cat("Turbidity rows:", nrow(turb), "\n")
+cat("Date range:", as.character(range(turb$date)), "\n")
+cat("Complete p95 rows:", sum(!is.na(turb$p95)), "\n")
+```
+
+---
+
+# 2. Streamflow — Canyon Mouth (CLAFTCCO, CDSSR)
+
+```{r load-flow}
+flow_raw <- get_sw_ts(
+  abbrev     = "CLAFTCCO",
+  start_date = "2010-01-01",
+  end_date   = "2025-12-31",
+  timescale  = "day"
+) %>%
+  mutate(date = as.Date(datetime)) %>%
+  select(date, canyon_mouth_cfs = value)
+
+cat("Flow rows:", nrow(flow_raw), "\n")
+cat("NA flow values:", sum(is.na(flow_raw$canyon_mouth_cfs)), "\n")
+```
+
+```{r flow-gap-fill}
+# Fill gaps up to 3 consecutive days via linear interpolation
+# (longer gaps left as NA for the model to handle)
+flow_clean <- flow_raw %>%
+  arrange(date) %>%
+  mutate(
+    canyon_mouth_cfs = zoo::na.approx(canyon_mouth_cfs,
+                                      maxgap = 3,
+                                      na.rm  = FALSE)
+  )
+
+cat("NA flow values after gap-fill (<=3d):", sum(is.na(flow_clean$canyon_mouth_cfs)), "\n")
+```
+
+---
+
+# 3. Precipitation — Redfeather Station (US1COLR0815, CDSSR)
+
+```{r load-precip}
+precip_raw <- get_climate_ts(
+  site_id    = "US1COLR0815",
+  param      = "Precip",
+  start_date = "2010-01-01",
+  end_date   = "2025-12-31",
+  timescale  = "day"
+) %>%
+  mutate(date = as.Date(datetime)) %>%
+  select(date, redfeather_precip_in = value)
+
+cat("Precip rows:", nrow(precip_raw), "\n")
+cat("NA precip values:", sum(is.na(precip_raw$redfeather_precip_in)), "\n")
+```
+
+---
+
+# 4. SNOTEL SWE — Cache la Poudre HUC (10190007)
+
+```{r snotel-download}
+snotel_sites <- snotel_info() %>%
+  filter(grepl("10190007", description))
+
+cat("Downloading SWE for", nrow(snotel_sites), "SNOTEL sites...\n")
+
+snotel_raw <- snotel_download(
+  site_id  = snotel_sites$site_id,
+  internal = TRUE,
+  metric   = TRUE
+) %>%
+  mutate(date = ymd(date))
+```
+
+```{r snotel-pca}
+# PCA on SWE across sites — PC1 captures dominant snowpack signal
+# Restrict PCA to dates with complete observations across all sites
+snotel_matrix <- snotel_raw %>%
+  filter(year(date) >= 2010) %>%
+  select(date, site_id, snow_water_equivalent) %>%
+  pivot_wider(names_from  = site_id,
+              names_prefix = "swe_",
+              values_from  = snow_water_equivalent) %>%
+  filter(complete.cases(.))
+
+pca_snotel <- snotel_matrix %>%
+  select(starts_with("swe_")) %>%
+  prcomp(center = TRUE, scale. = TRUE)
+
+cat("PC1 variance explained:",
+    round(summary(pca_snotel)$importance[2, 1] * 100, 1), "%\n")
+
+# Confirm sign convention: all loadings should be positive
+# If any are negative, flip the sign of swe_pc1 so that:
+#   high swe_pc1 = high snowpack, melt_rate_7d > 0 = active melt
+cat("PC1 site loadings:\n")
+print(round(pca_snotel$rotation[, 1], 3))
+
+snotel <- tibble(
+  date    = snotel_matrix$date,
+  swe_pc1 = pca_snotel$x[, 1]
+) %>%
+  arrange(date)
+
+# If PC1 loads negatively (all loadings < 0), flip sign
+if (all(pca_snotel$rotation[, 1] < 0)) {
+  snotel <- snotel %>% mutate(swe_pc1 = -swe_pc1)
+  message("PC1 sign flipped: loadings were all negative.")
+}
+```
+
+---
+
+# 5. PRISM Air Temperature (2018–2025)
+
+```{r load-temp}
+prism <- read_parquet(
+  here("data/collated/external_datasets/daily_precip_temp_prism_2018-06-27_to_2025-08-25.parquet")
+)
+
+# Inspect columns — may be gridded (long format) or already aggregated
+glimpse(prism)
+
+# Aggregate to watershed-mean Tmax and Tmin if gridded
+if ("tmax" %in% names(prism) || any(grepl("tmax", names(prism), ignore.case = TRUE))) {
+  tmax_col <- grep("tmax", names(prism), ignore.case = TRUE, value = TRUE)[1]
+  tmin_col <- grep("tmin", names(prism), ignore.case = TRUE, value = TRUE)[1]
+
+  prism_daily <- prism %>%
+    mutate(date = as.Date(date)) %>%
+    group_by(date) %>%
+    summarise(
+      tmax_c = mean(.data[[tmax_col]], na.rm = TRUE),
+      tmin_c = mean(.data[[tmin_col]], na.rm = TRUE),
+      .groups = "drop"
+    )
+} else {
+  # Already daily; rename as needed
+  prism_daily <- prism %>%
+    mutate(date = as.Date(date)) %>%
+    rename_with(tolower) %>%
+    select(date, contains("tmax"), contains("tmin"))
+}
+
+cat("PRISM temperature rows:", nrow(prism_daily), "\n")
+cat("Date range:", as.character(range(prism_daily$date)), "\n")
+```
+
+---
+
+# 6. Assemble Clean Dataset
+
+```{r assemble}
+# Build a complete daily spine 2010-01-01 to 2025-12-31
+date_spine <- tibble(date = seq.Date(as.Date("2010-01-01"),
+                                     as.Date("2025-12-31"),
+                                     by = "day"))
+
+daily_obs_drivers_clean <- date_spine %>%
+  left_join(turb    %>% select(date, doy, year, p95), by = "date") %>%
+  left_join(flow_clean,                                by = "date") %>%
+  left_join(precip_raw,                                by = "date") %>%
+  left_join(snotel,                                    by = "date") %>%
+  left_join(prism_daily,                               by = "date") %>%
+  mutate(
+    doy  = if_else(is.na(doy),  yday(date),  doy),
+    year = if_else(is.na(year), year(date),  year)
+  ) %>%
+  arrange(date)
+
+cat("Assembled dataset rows:", nrow(daily_obs_drivers_clean), "\n")
+
+# NA counts per column
+daily_obs_drivers_clean %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "column", values_to = "n_na") %>%
+  filter(n_na > 0) %>%
+  mutate(pct_na = round(100 * n_na / nrow(daily_obs_drivers_clean), 1)) %>%
+  arrange(desc(n_na)) %>%
+  print()
+```
+
+---
+
+# 7. Save
+
+```{r save}
+out_dir <- here("data/derived/models/turbidity_forecast")
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+write_parquet(
+  daily_obs_drivers_clean,
+  file.path(out_dir, "daily_obs_drivers_clean.parquet")
+)
+
+cat("Saved:", file.path(out_dir, "daily_obs_drivers_clean.parquet"), "\n")
+```

@@ -1,0 +1,280 @@
+---
+title: "08_make_forecasts — Daily p95 Turbidity Forecast (Modified Kemper)"
+author: "ROSSyndicate"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+library(here)
+library(tidyverse)
+library(lubridate)
+library(arrow)
+library(mgcv)
+library(lightgbm)
+
+source(knitr::purl(here("modeling/turbidity/modified_kemper_application_daily/00_functions.Rmd"),
+                   quiet = TRUE))
+```
+
+# Purpose
+
+Apply trained GAM and LightGBM models to HEFS forecast features to generate
+operational 1–3 day p95 turbidity forecasts at the FC Intake.
+
+Additionally, propagates HEFS ensemble uncertainty through the LightGBM model
+(applying the model to each of the 30 ensemble members) to produce a forecast
+distribution (p10, p50, p90).
+
+Output: `turbidity_forecasts_v{date}.parquet`
+
+---
+
+# Load Models and Data
+
+```{r load-models}
+# Trained GAMs
+final_gam_models <- readRDS(
+  here("data/derived/models/turbidity_forecast/final_gam_models.rds")
+)
+
+# LightGBM metadata (smearing factors + predictor lists)
+lgbm_model_meta <- readRDS(
+  here("data/derived/models/turbidity_forecast/lgbm_model_meta.rds")
+)
+
+# Load LightGBM model objects
+lgbm_models <- map(1:3, function(lead) {
+  lgb.load(here("data/derived/models/turbidity_forecast",
+                paste0("lgbm_daily_lead_t", lead, ".txt")))
+})
+names(lgbm_models) <- paste0("lead_t", 1:3)
+```
+
+```{r load-data}
+# HEFS forecast features (from 07_forecast_data_prep.Rmd)
+hefs_features <- read_parquet(
+  here("data/derived/models/turbidity_forecast/hefs_forecast_features.parquet")
+) %>%
+  mutate(regime = factor(regime, levels = c("snowmelt", "convective", "baseflow")),
+         regime_int = as.integer(regime))
+
+# Raw ensemble members for uncertainty propagation
+hefs_raw <- read_parquet(
+  here("data/derived/models/turbidity_forecast/hefs_forecasts_raw.parquet")
+)
+
+# Observed model data for context (init_date antecedent features)
+model_data <- read_parquet(
+  here("data/derived/models/turbidity_forecast/daily_model_data.parquet")
+)
+
+cat("HEFS feature rows:", nrow(hefs_features), "\n")
+cat("Init dates to forecast:", n_distinct(hefs_features$init_date), "\n")
+```
+
+---
+
+# Generate Deterministic Forecasts
+
+Apply GAM (global + regime) and LightGBM ensemble mean forecasts for leads
+t+1, t+2, t+3.
+
+```{r deterministic-forecasts}
+det_forecasts <- map_dfr(1:3, function(lead) {
+  lead_nm <- paste0("lead_t", lead)
+  gam_mods <- final_gam_models[[lead_nm]]
+  lgbm_mod  <- lgbm_models[[lead_nm]]
+  meta      <- lgbm_model_meta[[lead_nm]]
+
+  feat <- hefs_features %>% filter(lead_days == lead)
+
+  # ── GAM predictions ──────────────────────────────────────────────────────────
+  gam_global <- tryCatch(
+    as.numeric(predict(gam_mods$global, newdata = feat, type = "response")),
+    error = function(e) rep(NA_real_, nrow(feat))
+  )
+
+  gam_regime <- map2_dbl(
+    as.character(feat$regime), seq_len(nrow(feat)),
+    function(r, i) {
+      tryCatch(
+        as.numeric(predict(gam_mods$regime[[r]],
+                           newdata = feat[i, ], type = "response")),
+        error = function(e) NA_real_
+      )
+    }
+  )
+
+  # ── LightGBM predictions ─────────────────────────────────────────────────────
+  # Rename regime to integer for LightGBM
+  feat_lgbm <- feat %>%
+    mutate(regime = regime_int)
+
+  lgbm_pred <- tryCatch({
+    test_mat  <- data.matrix(feat_lgbm %>% select(all_of(meta$preds)))
+    log_pred  <- predict(lgbm_mod, data = test_mat)
+    (10^log_pred) * meta$smear_d
+  }, error = function(e) rep(NA_real_, nrow(feat)))
+
+  tibble(
+    init_date     = feat$init_date,
+    forecast_date = feat$forecast_date,
+    lead_days     = lead,
+    regime        = feat$regime,
+    hefs_mean_cfs = feat$hefs_mean_cfs,
+    obs_p95_init  = feat$p95,          # today's observed (persistence baseline)
+    gam_global    = gam_global,
+    gam_regime    = gam_regime,
+    lgbm_mean     = lgbm_pred
+  )
+})
+
+cat("Deterministic forecast rows:", nrow(det_forecasts), "\n")
+```
+
+---
+
+# Propagate HEFS Ensemble Uncertainty Through LightGBM
+
+Apply LightGBM to each of the 30 HEFS ensemble members to obtain a forecast
+distribution. Uses the same antecedent features from the init_date but swaps
+in each member's forecast flow.
+
+```{r ensemble-uncertainty}
+# Build per-member feature tables for each init_date × lead
+# Merge raw ensemble with init_date context from hefs_features (t+1 only for efficiency)
+
+init_context <- hefs_features %>%
+  select(init_date, lead_days,
+         canyon_mouth_cfs,           # observed flow at init_date
+         mean_q_7d, mean_q_30d, mean_q_90d,
+         max_q_30d, max_q_90d, max_q_365d,
+         time_since_30d_peak, time_since_90d_peak, time_since_annual_peak,
+         swe_pc1, melt_rate_7d, melt_rate_14d,
+         precip, precip_3day, precip_7day, precip_event,
+         tmax_5d_mean, swe_x_tmax,
+         doy, regime_int)
+
+ens_forecasts <- map_dfr(1:3, function(lead) {
+  meta     <- lgbm_model_meta[[paste0("lead_t", lead)]]
+  lgbm_mod <- lgbm_models[[paste0("lead_t", lead)]]
+
+  # Per-member daily flows at the forecast date
+  member_flows <- hefs_raw %>%
+    mutate(
+      init_date     = as.Date(forecast_date) - lead,
+      forecast_date = as.Date(date_time),
+      lead_days     = lead
+    ) %>%
+    filter(lead_days == lead) %>%
+    group_by(init_date, forecast_date, lead_days, ensemble_member) %>%
+    summarise(member_q_cfs = mean(value * 35.3147, na.rm = TRUE),
+              .groups = "drop")
+
+  ens_feat <- member_flows %>%
+    left_join(init_context %>% filter(lead_days == lead),
+              by = c("init_date", "lead_days")) %>%
+    drop_na(member_q_cfs, mean_q_7d) %>%
+    mutate(
+      log_q     = log1p(member_q_cfs),
+      log_q_sq  = log_q^2,
+      deltaQ_24h = member_q_cfs - canyon_mouth_cfs,
+      log_limb   = log_q - log1p(canyon_mouth_cfs),
+      dq_q       = (member_q_cfs - canyon_mouth_cfs) / canyon_mouth_cfs,
+      deltaQ_48h = deltaQ_24h,   # approximation for members
+      regime     = regime_int
+    )
+
+  # Apply model to each member
+  ens_mat  <- data.matrix(ens_feat %>% select(all_of(meta$preds)))
+  log_pred <- predict(lgbm_mod, data = ens_mat)
+  ens_pred <- (10^log_pred) * meta$smear_d
+
+  ens_feat %>%
+    mutate(lead_days = lead,
+           ens_pred_ntu = ens_pred) %>%
+    group_by(init_date, forecast_date, lead_days) %>%
+    summarise(
+      lgbm_p10 = quantile(ens_pred_ntu, 0.10, na.rm = TRUE),
+      lgbm_p50 = quantile(ens_pred_ntu, 0.50, na.rm = TRUE),
+      lgbm_p90 = quantile(ens_pred_ntu, 0.90, na.rm = TRUE),
+      n_members = n_distinct(ensemble_member),
+      .groups = "drop"
+    )
+})
+
+cat("Ensemble forecast rows:", nrow(ens_forecasts), "\n")
+```
+
+---
+
+# Assemble Final Forecast Table
+
+```{r assemble-forecasts}
+turbidity_forecasts <- det_forecasts %>%
+  left_join(ens_forecasts,
+            by = c("init_date", "forecast_date", "lead_days")) %>%
+  mutate(
+    # Combine GAM and LightGBM into a simple ensemble mean
+    ensemble_mean = rowMeans(cbind(gam_regime, lgbm_mean), na.rm = TRUE)
+  ) %>%
+  select(
+    init_date, forecast_date, lead_days, regime,
+    obs_p95_init,             # persistence baseline
+    gam_global, gam_regime,   # GAM predictions
+    lgbm_mean,                # LightGBM deterministic
+    lgbm_p10, lgbm_p50, lgbm_p90,  # LightGBM ensemble uncertainty
+    ensemble_mean,            # simple average of gam_regime + lgbm_mean
+    hefs_mean_cfs,
+    n_members
+  )
+
+cat("Final forecast rows:", nrow(turbidity_forecasts), "\n")
+glimpse(turbidity_forecasts)
+```
+
+---
+
+# Forecast Visualisation
+
+```{r forecast-plot, fig.dim = c(12, 6)}
+# Most recent init_date available
+latest_init <- max(turbidity_forecasts$init_date)
+
+turbidity_forecasts %>%
+  filter(init_date == latest_init) %>%
+  pivot_longer(cols = c(gam_regime, lgbm_mean, ensemble_mean),
+               names_to = "model", values_to = "forecast_ntu") %>%
+  ggplot(aes(x = forecast_date, y = forecast_ntu, color = model)) +
+  geom_ribbon(
+    data = turbidity_forecasts %>% filter(init_date == latest_init),
+    aes(x = forecast_date, ymin = lgbm_p10, ymax = lgbm_p90),
+    fill = "#d73027", alpha = 0.15, inherit.aes = FALSE
+  ) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_manual(values = c(gam_regime = "#2166ac",
+                                lgbm_mean  = "#d73027",
+                                ensemble_mean = "black")) +
+  scale_y_log10() +
+  theme_bw() +
+  labs(
+    title = paste0("p95 Turbidity Forecast — initialized ", latest_init),
+    subtitle = "Shaded band = LightGBM p10–p90 (HEFS ensemble spread)",
+    x = "Forecast date", y = "Forecast p95 NTU (log scale)", color = "Model"
+  )
+```
+
+---
+
+# Save
+
+```{r save}
+out_dir <- here("data/derived/models/turbidity_forecast")
+out_file <- file.path(out_dir, paste0("turbidity_forecasts_v", Sys.Date(), ".parquet"))
+write_parquet(turbidity_forecasts, out_file)
+cat("Saved:", out_file, "\n")
+```

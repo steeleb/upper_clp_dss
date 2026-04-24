@@ -272,9 +272,9 @@ Note, this only works for the previous ~ 24 h of forecasts.
 # 2900705 is `Reach ID` for canyon mouth https://water.noaa.gov/gauges/FTDC2
 comid <- "2900705" 
 
-urls <- get_nomads_urls(config = "medium_range_blend", #short_range, medium_range, medium_range_blend
-                        date = "20251207", # date of forecast
-                        #ensemble = NA, # if medium_range, must supply ensemble number
+urls <- get_nomads_urls(config = "medium_range", #short_range, medium_range, medium_range_blend
+                        date = "20260401", # date of forecast
+                        ensemble = 1, # if medium_range, must supply ensemble number
                         output = "channel_rt", 
                         outdir = tempdir(),
                         num = 24)

@@ -1,0 +1,309 @@
+---
+title: "01_data_discovery — Daily p95 Turbidity Forecast (Modified Kemper)"
+author: "ROSSyndicate"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+library(here)
+library(tidyverse)
+library(snotelr)
+library(cdssr)
+library(arrow)
+```
+
+# Purpose
+
+Inventory all data sources needed for the daily p95 turbidity forecast workflow.
+Confirms site availability, date coverage, and flags any gaps before data are
+downloaded in `02_observational_data_prep.Rmd`.
+
+Analogous to `kemper_turb_method/01_data_discovery.Rmd` but adapted for:
+- Cache la Poudre watershed (CDSSR instead of USGS NWIS)
+- Daily p95 turbidity target (pre-computed quantile CSV)
+- SNOTEL snowpack network (new relative to Kemper)
+- HEFS ensemble forecasts (NOAA NWPS API, analogous to Kemper's NWM)
+
+---
+
+# 1. Turbidity Target — FC Intake & Munroe Canal
+
+```{r turb-inventory}
+turb_raw <- read_csv(
+  here("data/collated/FC_intake/fc_intake_munroe_turbidity_quantile_record_2010-2025.csv"),
+  show_col_types = FALSE
+)
+
+# Date coverage and completeness by location
+turb_raw %>%
+  group_by(location) %>%
+  summarise(
+    first_date   = min(date),
+    last_date    = max(date),
+    n_total      = n(),
+    n_complete   = sum(!is.na(p95)),
+    pct_complete = round(100 * n_complete / n_total, 1)
+  )
+```
+
+```{r turb-annual-gaps}
+# Annual completeness for the intake (modeling target)
+turb_raw %>%
+  filter(location == "intake_turb_NTU") %>%
+  mutate(year = lubridate::year(date)) %>%
+  group_by(year) %>%
+  summarise(
+    n_days     = n(),
+    n_complete = sum(!is.na(p95)),
+    pct_complete = round(100 * n_complete / n_days, 1)
+  ) %>%
+  print(n = Inf)
+```
+
+**Note:** The `intake_turb_NTU` location is the modeling target.
+`munroe_turb_NTU` has sparse coverage especially before 2018 and is not used
+as a modeling target but may be useful as an upstream network predictor when
+available.
+
+---
+
+# 2. Streamflow — Canyon Mouth (CLAFTCCO, CDSSR)
+
+```{r flow-check}
+# Pull a small test window to confirm API access and units
+flow_test <- get_sw_ts(
+  abbrev     = "CLAFTCCO",
+  start_date = "2023-01-01",
+  end_date   = "2023-12-31",
+  timescale  = "day"
+)
+
+cat("Rows returned:", nrow(flow_test), "\n")
+cat("Columns:", paste(names(flow_test), collapse = ", "), "\n")
+cat("Flow units (parameter):", unique(flow_test$meas_unit), "\n")
+cat("Date range:", as.character(range(flow_test$datetime)), "\n")
+```
+
+```{r flow-annual-summary}
+# Full-period summary (will take a moment to pull)
+flow_full <- get_sw_ts(
+  abbrev     = "CLAFTCCO",
+  start_date = "2010-01-01",
+  end_date   = "2025-12-31",
+  timescale  = "day"
+)
+
+flow_full %>%
+  mutate(year = lubridate::year(datetime)) %>%
+  group_by(year) %>%
+  summarise(
+    n_days     = n(),
+    n_complete = sum(!is.na(value)),
+    pct_complete = round(100 * n_complete / n_days, 1),
+    mean_cfs   = round(mean(value, na.rm = TRUE), 1),
+    max_cfs    = round(max(value,  na.rm = TRUE), 1)
+  ) %>%
+  print(n = Inf)
+```
+
+---
+
+# 3. Precipitation — Redfeather Station (CDSSR climate)
+
+```{r precip-check}
+precip_test <- get_climate_ts(
+  site_id    = "US1COLR0815",
+  param      = "Precip",
+  start_date = "2023-01-01",
+  end_date   = "2023-12-31",
+  timescale  = "day"
+)
+
+cat("Rows returned:", nrow(precip_test), "\n")
+cat("Date range:", as.character(range(precip_test$datetime)), "\n")
+cat("Units:", unique(precip_test$meas_unit), "\n")
+
+# Annual completeness
+get_climate_ts(
+  site_id    = "US1COLR0815",
+  param      = "Precip",
+  start_date = "2010-01-01",
+  end_date   = "2025-12-31",
+  timescale  = "day"
+) %>%
+  mutate(year = lubridate::year(datetime)) %>%
+  group_by(year) %>%
+  summarise(
+    n_days     = n(),
+    n_complete = sum(!is.na(value)),
+    pct_complete = round(100 * n_complete / n_days, 1)
+  ) %>%
+  print(n = Inf)
+```
+
+---
+
+# 4. SNOTEL Network — Cache la Poudre HUC (10190007)
+
+```{r snotel-sites}
+# All SNOTEL sites that mention the CLP HUC in their description
+snotel_sites <- snotel_info() %>%
+  filter(grepl("10190007", description))
+
+cat("SNOTEL sites in HUC 10190007:\n")
+snotel_sites %>%
+  select(site_id, site_name, state, start, end, description) %>%
+  print()
+```
+
+```{r snotel-coverage}
+# Download all sites to inspect coverage; filter to 2010–2025
+snotel_all <- snotel_download(
+  site_id  = snotel_sites$site_id,
+  internal = TRUE,
+  metric   = TRUE
+) %>%
+  mutate(date = lubridate::ymd(date),
+         year = lubridate::year(date))
+
+# SWE completeness per site per year
+snotel_all %>%
+  filter(lubridate::year(date) >= 2010) %>%
+  group_by(site_id, year) %>%
+  summarise(
+    n_days     = n(),
+    n_swe      = sum(!is.na(snow_water_equivalent)),
+    pct_swe    = round(100 * n_swe / n_days, 1),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(names_from = year, values_from = pct_swe,
+              names_prefix = "WY") %>%
+  print()
+```
+
+```{r snotel-pca-preview}
+# Quick PCA preview to confirm all sites load positively on PC1
+snotel_matrix <- snotel_all %>%
+  filter(lubridate::year(date) >= 2010) %>%
+  select(date, site_id, snow_water_equivalent) %>%
+  pivot_wider(names_from  = site_id,
+              names_prefix = "swe_",
+              values_from  = snow_water_equivalent) %>%
+  filter(complete.cases(.))
+
+pca_preview <- snotel_matrix %>%
+  select(starts_with("swe_")) %>%
+  prcomp(center = TRUE, scale. = TRUE)
+
+cat("PC1 variance explained:",
+    round(summary(pca_preview)$importance[2, 1] * 100, 1), "%\n")
+cat("PC1 site loadings (all should be same sign):\n")
+print(round(pca_preview$rotation[, 1], 3))
+```
+
+---
+
+# 5. PRISM Air Temperature
+
+```{r prism-check}
+prism <- read_parquet(
+  here("data/collated/external_datasets/daily_precip_temp_prism_2018-06-27_to_2025-08-25.parquet")
+)
+
+cat("PRISM columns:", paste(names(prism), collapse = ", "), "\n")
+cat("Date range:", as.character(range(prism$date, na.rm = TRUE)), "\n")
+cat("Rows:", nrow(prism), "\n")
+glimpse(prism)
+```
+
+**Note:** PRISM temperature is available from 2018-06-27 onward only.
+Temperature-based features (`tmax_5d_mean`, `swe_x_tmax`) will be NA for
+2010–2018; LightGBM handles NA natively, but GAMs require complete rows.
+Consider excluding those features from GAM formulas or using 2018+ data
+for the temperature interaction term.
+
+---
+
+# 6. Larimer County Network Stations
+
+```{r larimer-check}
+larimer <- read_parquet(
+  here("data/collated/external_datasets/larimer_county_station_flow_precip_20210101_20251201.parquet")
+)
+
+cat("Columns:", paste(names(larimer), collapse = ", "), "\n")
+cat("Date range:", as.character(range(larimer$date, na.rm = TRUE)), "\n")
+
+# Station inventory
+larimer %>%
+  count(station_name) %>%
+  print(n = Inf)
+```
+
+**Note:** Larimer County network data begins 2021-01-01. These stations can
+serve as an upstream network analog to Kemper's tributary stations, but
+coverage is too short for model training (which uses 2010–2023). They may
+be used as supplemental predictors in an extended model or for operational
+HEFS feature construction (scripts 06–07).
+
+---
+
+# 7. HEFS Forecast Availability — Canyon Mouth Gauge
+
+```{r hefs-gauge-check}
+source(here("src/hefs/get_hefs_gauges.R"))
+
+# Find the NWPS gauge ID corresponding to Canyon Mouth / Poudre at Canyon Mouth
+# Typically searched by state or HUC; adjust state as needed
+hefs_gauges <- get_hefs_gauges()
+
+# Filter to Colorado Poudre-area gauges
+hefs_gauges %>%
+  filter(grepl("POUDRE|CANYON|COLOC", lid, ignore.case = TRUE) |
+           grepl("Colorado", state, ignore.case = TRUE)) %>%
+  select(lid, name, state, rfc) %>%
+  print()
+```
+
+```{r hefs-test-pull}
+source(here("src/hefs/get_hefs_ensembles.R"))
+
+# Test pull using the confirmed gauge ID (update CANYON_MOUTH_ID after inspection above)
+# The NWPS gauge for Canyon Mouth is typically "COLOC070" or similar — confirm above.
+CANYON_MOUTH_HEFS_ID <- "COLOC070"  # update after running hefs-gauge-check
+
+test_forecast <- get_hefs_ensemble(
+  ID   = CANYON_MOUTH_HEFS_ID,
+  date = Sys.Date() - 1  # yesterday's forecast
+)
+
+if (!is.null(test_forecast)) {
+  cat("HEFS test pull successful.\n")
+  cat("Forecast rows:", nrow(test_forecast), "\n")
+  cat("Date range:", as.character(range(test_forecast$date_time)), "\n")
+  cat("Ensemble members:", length(unique(test_forecast$ensemble_member)), "\n")
+  glimpse(test_forecast)
+} else {
+  cat("HEFS pull returned NULL — check gauge ID and API availability.\n")
+}
+```
+
+---
+
+# Summary
+
+```{r summary-table}
+tibble::tribble(
+  ~Data_Source,        ~Coverage,            ~Resolution, ~Status,
+  "Turbidity (intake)", "2010–2025",          "daily p05–p95", "ready",
+  "Canyon Mouth Q",    "2010–2025",          "daily CFS",     "ready",
+  "Redfeather Precip", "2010–2025",          "daily inches",  "ready",
+  "SNOTEL SWE",        "2010–2025 (varies)", "daily mm",      "confirm coverage",
+  "PRISM Tmax/Tmin",   "2018–2025",          "daily °C",      "ready (2018+)",
+  "Larimer County Q/P","2021–2025",          "daily",         "supplemental only",
+  "HEFS Forecasts",    "2023–2025+",         "ensemble daily","confirm gauge ID"
+) %>% knitr::kable()
+```

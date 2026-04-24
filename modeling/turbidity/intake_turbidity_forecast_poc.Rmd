@@ -27,8 +27,8 @@ of three regimes and fit a lightweight GAM per regime:
 
 | Regime | Drivers | GAM predictors |
 |---|---|---|
-| **Snowmelt** | DOY 60–180, active melt | DOY, log(Q), melt rate |
-| **Convective** | Precip event (any season) | log(Q), ΔQ₂₄ₕ, precip features |
+| **Snowmelt** | DOY 100–160, active melt | DOY, log(Q), melt rate |
+| **Convective** | Precip event (June - ) | log(Q), ΔQ₂₄ₕ, precip features |
 | **Baseflow** | Everything else | DOY, log(Q) |
 
 All three are compared against a **global GAM** and a **persistence baseline**
@@ -44,9 +44,9 @@ positive, right-skewed turbidity data and does not require a manual log transfor
 
 ```{r constants}
 # ── Regime classification thresholds ─────────────────────────────────────────
-PRECIP_THRESH          <- 0.4   # inches: binary event indicator
-CONVECTIVE_PRECIP_THRESH <- 1  # inches over 3 days: antecedent wetness
-MELT_THRESH            <- 0     # melt_rate_7d > this → active snowmelt
+PRECIP_THRESH <- 0.2   # inches: binary event indicator
+CONVECTIVE_PRECIP_THRESH <- 0.5  # inches over 3 days: antecedent wetness
+MELT_THRESH <- 0     # melt_rate_7d > this → active snowmelt
 
 # ── Evaluation ────────────────────────────────────────────────────────────────
 HIGH_TURB_THRESH       <- 75    # NTU: threshold for high-turbidity event evaluation
@@ -69,11 +69,17 @@ cv_folds <- list(
 # Global model: all predictors, all data
 GLOBAL_FORMULA <- target_p95 ~
   s(doy, bs = "cc", k = 10) +
-  s(log_q, k = 10) +
   s(deltaQ_24h, k = 10) +
-  precip_3day +
   precip_event +
   s(melt_rate_7d, bs = "ts", k = 8)
+
+# GLOBAL_FORMULA <- target_p95 ~
+#   s(doy, bs = "cc", k = 10) +
+#   s(log_q, k = 10) +
+#   s(deltaQ_24h, k = 10) +
+#   precip_3day +
+#   precip_event +
+#   s(melt_rate_7d, bs = "ts", k = 8)
 
 # GLOBAL_FORMULA <- target_p95 ~
 #   s(doy, bs = "cc", k = 8) +
@@ -87,18 +93,30 @@ GLOBAL_FORMULA <- target_p95 ~
 # bs = "tp" for regime-specific DOY terms (data may not span full year,
 # so the cyclic constraint of "cc" is inappropriate).
 REGIME_FORMULAS <- list(
-  snowmelt   = target_p95 ~ s(doy, bs = "tp", k = 10) +
+  snowmelt = target_p95 ~ 
     s(log_q, k = 10) +
     s(melt_rate_7d, bs = "ts", k = 8),
   convective = target_p95 ~ s(log_q, k = 8) +
     s(deltaQ_24h, k = 8) +
-    precip_3day +
     precip_event,
-  baseflow   = target_p95 ~ s(doy, bs = "cc", k = 10) +
-    s(log_q, k = 8) +
-    s(deltaQ_24h, k = 8)
+  baseflow   = target_p95 ~ 
+    s(doy, bs = "cc", k = 10) +
+    s(log_q, k = 8) 
   
 )
+# REGIME_FORMULAS <- list(
+#   snowmelt   = target_p95 ~ s(doy, bs = "tp", k = 10) +
+#     s(log_q, k = 10) +
+#     s(melt_rate_7d, bs = "ts", k = 8),
+#   convective = target_p95 ~ s(log_q, k = 8) +
+#     s(deltaQ_24h, k = 8) +
+#     precip_3day +
+#     precip_event,
+#   baseflow   = target_p95 ~ s(doy, bs = "cc", k = 10) +
+#     s(log_q, k = 8) +
+#     s(deltaQ_24h, k = 8)
+#   
+# )
 
 # REGIME_FORMULAS <- list(
 #   snowmelt   = target_p95 ~ s(doy, bs = "tp", k = 6) +
@@ -232,9 +250,10 @@ model_data <- turb %>%
   mutate(
     # Regime classification (priority: convective > snowmelt > baseflow)
     regime = case_when(
-      # may through september
-      doy %in% 150:300 & precip_event == 1 | precip_3day > CONVECTIVE_PRECIP_THRESH  ~ "convective",
-      !is.na(melt_rate_7d) & melt_rate_7d > MELT_THRESH ~ "snowmelt",
+      # june through september
+      doy %in% 150:300 & (precip_event == 1 | precip_3day > CONVECTIVE_PRECIP_THRESH)  ~ "convective",
+      # jan through june
+      !is.na(melt_rate_7d) & melt_rate_7d > MELT_THRESH & doy %in% 0:210 ~ "snowmelt",
       .default =  "baseflow"
     ),
     regime = factor(regime, levels = c("snowmelt", "convective", "baseflow"))
@@ -462,12 +481,14 @@ cv_results %>%
   ggplot(aes(x = date)) +
   geom_point(aes(y = observed, color = regime), size = 0.8, alpha = 0.8) +
   geom_line(aes(y = hierarchical_gam), color = "black", linewidth = 0.5) +
-  geom_line(aes(y = persistence), color = "grey50", linewidth = 0.4, linetype = "dashed") +
+  geom_line(aes(y = global_gam), color = "orange", linewidth = 0.5) +
+  #geom_line(aes(y = persistence), color = "grey50", linewidth = 0.4, linetype = "dashed") +
   geom_hline(yintercept = HIGH_TURB_THRESH, linetype = "dotted", color = "grey40") +
   scale_color_manual(values = c(snowmelt = "#2166ac", convective = "#d73027",
                                 baseflow = "#4dac26")) +
   scale_y_continuous(limits = c(0, NA)) +
   facet_wrap(~ fold_label, scales = "free_x", ncol = 1) +
+  coord_cartesian(ylim = c(0, 250)) +
   theme_bw() +
   theme(legend.position = "bottom") +
   labs(

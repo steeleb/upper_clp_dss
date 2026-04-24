@@ -41,7 +41,9 @@ flow_data <- get_sw_ts(abbrev = "CLAFTCCO",
   select(datetime, canyon_mouth_cfs = value) %>% 
   mutate(date = date(datetime), 
          year = year(date),
-         doy = yday(date)) 
+         doy = yday(date)) %>% 
+  arrange(date) %>% 
+  mutate(smooth_q = frollmean(canyon_mouth_cfs, 7))
 
 turb_q <- full_join(turb, flow_data)
 ```
@@ -139,6 +141,9 @@ turb_apr_sept_lagQ <- turb_q %>%
   mutate(deltaQ_24h = canyon_mouth_cfs - lag(canyon_mouth_cfs),
          deltaQ_48h = canyon_mouth_cfs - lag(canyon_mouth_cfs, n = 2),
          deltaQ_72h = canyon_mouth_cfs - lag(canyon_mouth_cfs, n = 3),
+         deltaQ_24hs = smooth_q - lag(smooth_q), 
+         deltaQ_72hs = smooth_q - lag(smooth_q, 3), 
+         deltaQ_1wks = smooth_q - lag(smooth_q, 7),
          .by = location)
 
 turb_apr_sept_lagQ %>% 

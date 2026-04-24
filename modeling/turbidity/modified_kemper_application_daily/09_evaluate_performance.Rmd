@@ -1,0 +1,357 @@
+---
+title: "09_evaluate_performance — Daily p95 Turbidity Forecast (Modified Kemper)"
+author: "ROSSyndicate"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+library(here)
+library(tidyverse)
+library(lubridate)
+library(arrow)
+library(hydroGOF)
+library(patchwork)
+
+source(knitr::purl(here("modeling/turbidity/modified_kemper_application_daily/00_functions.Rmd"),
+                   quiet = TRUE))
+```
+
+# Purpose
+
+Comprehensive evaluation of turbidity forecast skill using:
+1. **Overall metrics** — RMSE, MAE, NSE, KGE (decomposed), PBIAS, r, R²
+2. **Lead-time analysis** — skill decay from t+1 to t+3
+3. **Regime-stratified metrics** — snowmelt vs. convective vs. baseflow
+4. **High-turbidity event evaluation** — events > 10 NTU and > 75 NTU
+5. **Event catalog comparison** — peak p95 error per event
+
+Two evaluation periods are reported:
+- **Cross-validation (2010–2023):** from `05_model_development.Rmd` CV predictions
+- **Test period (2024–2025):** held-out independent evaluation
+
+---
+
+# Constants
+
+```{r constants}
+TURB_EVENT_THRESH <- 10   # NTU — elevated
+TURB_HIGH_THRESH  <- 75   # NTU — high-turbidity treatment concern
+
+MODEL_NAMES <- c("persistence", "gam_global", "gam_regime", "lgbm_mean", "ensemble_mean")
+MODEL_COLORS <- c(
+  persistence   = "grey50",
+  gam_global    = "#7fbfff",
+  gam_regime    = "#2166ac",
+  lgbm_mean     = "#d73027",
+  ensemble_mean = "black"
+)
+```
+
+---
+
+# Load Data
+
+```{r load-data}
+# Forecast output from 08_make_forecasts.Rmd
+forecast_files <- list.files(
+  here("data/derived/models/turbidity_forecast"),
+  pattern = "^turbidity_forecasts_v.+\\.parquet$",
+  full.names = TRUE
+)
+# Use most recent file
+forecasts <- read_parquet(forecast_files[length(forecast_files)])
+
+# Observed p95 for matching to forecast dates
+observed <- read_parquet(
+  here("data/derived/models/turbidity_forecast/daily_model_data.parquet")
+) %>%
+  select(date, p95_observed = p95, regime)
+
+# Event catalog from 04_event_delineation.Rmd
+event_catalog <- read_parquet(
+  here("data/derived/models/turbidity_forecast/turbidity_event_catalog.parquet")
+)
+
+cat("Forecast rows:", nrow(forecasts), "\n")
+cat("Init date range:", as.character(range(forecasts$init_date)), "\n")
+```
+
+```{r merge-observed}
+eval_data <- forecasts %>%
+  left_join(observed %>% rename(forecast_date = date),
+            by = "forecast_date",
+            suffix = c("_fc", "_obs")) %>%
+  rename(
+    observed   = p95_observed,
+    regime_obs = regime_obs
+  ) %>%
+  drop_na(observed)
+
+cat("Evaluation rows (with observed p95):", nrow(eval_data), "\n")
+```
+
+---
+
+# 1. Overall Performance Metrics
+
+```{r overall-metrics}
+overall_metrics <- eval_data %>%
+  drop_na(all_of(MODEL_NAMES)) %>%
+  group_by(lead_days) %>%
+  summarise(
+    across(
+      all_of(MODEL_NAMES),
+      ~ error_estimator(.x, observed, "model")$rmse,
+      .names = "{.col}_rmse"
+    ),
+    .groups = "drop"
+  )
+
+cat("Overall RMSE by lead time:\n")
+print(overall_metrics)
+```
+
+```{r full-metrics-table}
+full_metrics <- map_dfr(MODEL_NAMES, function(mod) {
+  eval_data %>%
+    filter(!is.na(.data[[mod]]), !is.na(observed)) %>%
+    group_by(lead_days) %>%
+    summarise(
+      error_estimator(.data[[mod]], observed, mod),
+      .groups = "drop"
+    )
+}) %>%
+  arrange(lead_days, model)
+
+full_metrics %>%
+  select(lead_days, model, rmse, mae, nse, kge, pbias, corr) %>%
+  knitr::kable(digits = 3, caption = "Full performance metrics by model and lead time")
+```
+
+---
+
+# 2. Lead-Time Skill Decay
+
+```{r lead-decay-plot, fig.dim = c(8, 5)}
+full_metrics %>%
+  filter(model != "persistence") %>%
+  ggplot(aes(x = lead_days, y = rmse, color = model, group = model)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.5) +
+  geom_hline(
+    data = full_metrics %>% filter(model == "persistence") %>%
+      group_by(lead_days) %>% summarise(persistence_rmse = mean(rmse)),
+    aes(yintercept = persistence_rmse),
+    linetype = "dashed", color = "grey50"
+  ) +
+  scale_color_manual(values = MODEL_COLORS[MODEL_NAMES != "persistence"]) +
+  scale_x_continuous(breaks = 1:3) +
+  theme_bw() +
+  labs(title = "Forecast RMSE by lead time",
+       subtitle = "Dashed = persistence baseline",
+       x = "Lead time (days)", y = "RMSE (NTU)", color = "Model")
+```
+
+```{r nse-kge-plot, fig.dim = c(10, 4)}
+full_metrics %>%
+  select(lead_days, model, nse, kge) %>%
+  pivot_longer(cols = c(nse, kge), names_to = "metric") %>%
+  ggplot(aes(x = lead_days, y = value, color = model, group = model)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey70") +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.5) +
+  facet_wrap(~ metric) +
+  scale_color_manual(values = MODEL_COLORS) +
+  scale_x_continuous(breaks = 1:3) +
+  theme_bw() +
+  labs(title = "NSE and KGE by lead time",
+       x = "Lead time (days)", y = NULL, color = "Model")
+```
+
+---
+
+# 3. Regime-Stratified Metrics
+
+```{r regime-metrics}
+regime_metrics <- map_dfr(MODEL_NAMES, function(mod) {
+  eval_data %>%
+    filter(!is.na(.data[[mod]]), !is.na(observed)) %>%
+    group_by(lead_days, regime = regime_fc) %>%
+    summarise(
+      error_estimator(.data[[mod]], observed, mod),
+      n = n(),
+      .groups = "drop"
+    )
+}) %>%
+  arrange(regime, lead_days, model)
+
+regime_metrics %>%
+  select(lead_days, regime, model, rmse, nse, kge, n) %>%
+  filter(lead_days == 1) %>%
+  knitr::kable(digits = 3, caption = "t+1 metrics by regime (all models)")
+```
+
+```{r regime-rmse-plot, fig.dim = c(10, 5)}
+regime_metrics %>%
+  filter(model %in% c("persistence", "gam_regime", "lgbm_mean")) %>%
+  ggplot(aes(x = lead_days, y = rmse, color = model, group = model)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.5) +
+  facet_wrap(~ regime) +
+  scale_color_manual(values = MODEL_COLORS) +
+  scale_x_continuous(breaks = 1:3) +
+  theme_bw() +
+  labs(title = "RMSE by regime and lead time",
+       x = "Lead time (days)", y = "RMSE (NTU)", color = "Model")
+```
+
+---
+
+# 4. High-Turbidity Event Evaluation
+
+```{r high-turb-metrics}
+# Metrics computed only on days when observed p95 exceeds thresholds
+thresholds <- c(event = TURB_EVENT_THRESH, high = TURB_HIGH_THRESH)
+
+ht_metrics <- map_dfr(names(thresholds), function(thresh_nm) {
+  thresh <- thresholds[thresh_nm]
+  map_dfr(MODEL_NAMES, function(mod) {
+    eval_data %>%
+      filter(observed > thresh, !is.na(.data[[mod]])) %>%
+      group_by(lead_days) %>%
+      summarise(
+        error_estimator(.data[[mod]], observed, mod),
+        n        = n(),
+        threshold = paste0(">", thresh, " NTU"),
+        .groups = "drop"
+      )
+  })
+})
+
+ht_metrics %>%
+  filter(lead_days == 1) %>%
+  select(threshold, model, rmse, mae, nse, pbias, n) %>%
+  knitr::kable(digits = 3, caption = "High-turbidity subset metrics (t+1)")
+```
+
+---
+
+# 5. Event Catalog Evaluation
+
+Compare peak p95 forecasts against event-catalog peaks.
+
+```{r event-eval}
+# For each event in the catalog, find the forecast issued closest to the event peak
+event_eval <- event_catalog %>%
+  mutate(peak_date = event_start + days(which.max(peak_p95))) %>%
+  select(event_id, event_type, peak_date = event_start, peak_p95) %>%
+  mutate(peak_date = event_start) %>%
+  # Attempt to find a t+1 forecast for each event's start date
+  left_join(
+    eval_data %>% filter(lead_days == 1) %>%
+      select(forecast_date, gam_regime, lgbm_mean, ensemble_mean),
+    by = c("peak_date" = "forecast_date")
+  ) %>%
+  drop_na(gam_regime)
+
+event_eval %>%
+  mutate(
+    gam_regime_err  = gam_regime  - peak_p95,
+    lgbm_err        = lgbm_mean   - peak_p95,
+    ensemble_err    = ensemble_mean - peak_p95
+  ) %>%
+  group_by(event_type) %>%
+  summarise(
+    n_events        = n(),
+    mean_gam_err    = round(mean(gam_regime_err,  na.rm = TRUE), 1),
+    mean_lgbm_err   = round(mean(lgbm_err,        na.rm = TRUE), 1),
+    mean_ens_err    = round(mean(ensemble_err,     na.rm = TRUE), 1),
+    rmse_gam        = round(sqrt(mean(gam_regime_err^2,   na.rm = TRUE)), 1),
+    rmse_lgbm       = round(sqrt(mean(lgbm_err^2,         na.rm = TRUE)), 1),
+    .groups = "drop"
+  ) %>%
+  knitr::kable(caption = "Event-based evaluation by event type (t+1 forecast at event start)")
+```
+
+```{r event-scatter, fig.dim = c(8, 4)}
+event_eval %>%
+  pivot_longer(cols = c(gam_regime, lgbm_mean),
+               names_to = "model", values_to = "forecast") %>%
+  ggplot(aes(x = peak_p95, y = forecast, color = event_type, shape = model)) +
+  geom_point(size = 2.5, alpha = 0.8) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  scale_color_manual(
+    values = c(snowmelt = "#2166ac", convective = "#d73027", "baseflow/other" = "#4dac26")
+  ) +
+  scale_x_log10() + scale_y_log10() +
+  theme_bw() +
+  labs(title = "Event peak: forecast vs. observed p95 NTU (t+1)",
+       x = "Observed peak p95 (NTU)", y = "Forecast p95 (NTU)",
+       color = "Event type", shape = "Model")
+```
+
+---
+
+# 6. KGE Decomposition
+
+```{r kge-decomposition}
+kge_decomp <- map_dfr(MODEL_NAMES, function(mod) {
+  eval_data %>%
+    filter(!is.na(.data[[mod]]), !is.na(observed)) %>%
+    group_by(lead_days) %>%
+    summarise(
+      model = mod,
+      decompose_kge(.data[[mod]], observed),
+      .groups = "drop"
+    )
+})
+
+kge_decomp %>%
+  filter(lead_days == 1) %>%
+  select(model, r, bias, variability, kge_manual) %>%
+  knitr::kable(digits = 3, caption = "KGE decomposition (t+1 forecasts)")
+```
+
+---
+
+# 7. Forecast Time Series — Test Period
+
+```{r test-ts-t1, fig.dim = c(14, 5)}
+eval_data %>%
+  filter(lead_days == 1) %>%
+  pivot_longer(cols = c(observed, gam_regime, lgbm_mean, persistence),
+               names_to = "series", values_to = "ntu") %>%
+  ggplot(aes(x = forecast_date, y = ntu, color = series)) +
+  geom_line(linewidth = 0.5, alpha = 0.85) +
+  geom_ribbon(
+    data = eval_data %>% filter(lead_days == 1,
+                                !is.na(lgbm_p10), !is.na(lgbm_p90)),
+    aes(x = forecast_date, ymin = lgbm_p10, ymax = lgbm_p90),
+    fill = "#d73027", alpha = 0.10, inherit.aes = FALSE
+  ) +
+  scale_color_manual(values = c(observed    = "black",
+                                gam_regime  = "#2166ac",
+                                lgbm_mean   = "#d73027",
+                                persistence = "grey50")) +
+  scale_y_log10() +
+  theme_bw() +
+  labs(title = "t+1 forecast vs. observed p95 NTU — full evaluation period",
+       subtitle = "Shaded band = LightGBM ensemble p10–p90",
+       x = NULL, y = "p95 NTU (log scale)", color = NULL)
+```
+
+---
+
+# Summary Table
+
+```{r summary-table}
+full_metrics %>%
+  select(lead_days, model, rmse, nse, kge, pbias) %>%
+  pivot_longer(cols = c(rmse, nse, kge, pbias)) %>%
+  pivot_wider(names_from = c(name, lead_days),
+              names_glue = "{name}_t{lead_days}") %>%
+  knitr::kable(digits = 3, caption = "Summary: all metrics across lead times")
+```

@@ -1,0 +1,224 @@
+---
+title: "04_event_delineation — Daily p95 Turbidity Forecast (Modified Kemper)"
+author: "ROSSyndicate"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+library(here)
+library(tidyverse)
+library(lubridate)
+library(arrow)
+```
+
+# Purpose
+
+Identify and characterise high-turbidity events in the historical record.
+Produces an **event catalog** (`turbidity_event_catalog.parquet`) that is used in
+`09_evaluate_performance.Rmd` for event-based forecast evaluation.
+
+Analogous to `kemper_turb_method/04_event_delineation.Rmd` but adapted for:
+- Daily resolution (no hydroEvents package needed — events defined by threshold runs)
+- Two distinct event types: **snowmelt** (DOY 90–180) and **convective** (DOY 150–300)
+- NTU p95 target rather than instantaneous FNU
+
+---
+
+# Constants
+
+```{r constants}
+# Turbidity threshold above which a day is considered an "event day"
+# Adjust after visual inspection of the distribution
+TURB_EVENT_THRESH <- 10   # NTU p95: elevated, not extreme
+TURB_HIGH_THRESH  <- 75   # NTU p95: high-turbidity event (treatment concern)
+
+# Minimum number of consecutive event days to count as an event
+MIN_EVENT_DAYS <- 1
+
+# DOY windows for regime-based event typing
+SNOWMELT_DOY_RANGE  <- 90:180
+CONVECTIVE_DOY_RANGE <- 150:300
+```
+
+---
+
+# Load Data
+
+```{r load-data}
+model_data <- read_parquet(
+  here("data/derived/models/turbidity_forecast/daily_model_data.parquet")
+)
+
+# Restrict to training period for event catalog
+train_data <- model_data %>%
+  filter(year %in% 2010:2023, !is.na(p95))
+
+cat("Training rows with observed p95:", nrow(train_data), "\n")
+```
+
+---
+
+# Turbidity Distribution
+
+```{r turb-distribution, fig.dim = c(8, 4)}
+train_data %>%
+  ggplot(aes(x = p95)) +
+  geom_histogram(bins = 60, fill = "steelblue", color = "white") +
+  scale_x_log10() +
+  geom_vline(xintercept = TURB_EVENT_THRESH, color = "orange",
+             linetype = "dashed", linewidth = 0.8) +
+  geom_vline(xintercept = TURB_HIGH_THRESH,  color = "red",
+             linetype = "dashed", linewidth = 0.8) +
+  annotate("text", x = TURB_EVENT_THRESH * 1.2, y = Inf,
+           label = paste0("Event (", TURB_EVENT_THRESH, " NTU)"),
+           hjust = 0, vjust = 1.5, color = "orange", size = 3) +
+  annotate("text", x = TURB_HIGH_THRESH * 1.2, y = Inf,
+           label = paste0("High (", TURB_HIGH_THRESH, " NTU)"),
+           hjust = 0, vjust = 1.5, color = "red", size = 3) +
+  theme_bw() +
+  labs(title = "Distribution of daily p95 turbidity (2010–2023, log scale)",
+       x = "p95 NTU", y = "Count")
+```
+
+```{r percentile-summary}
+# How many days exceed each threshold?
+train_data %>%
+  summarise(
+    n_above_event = sum(p95 > TURB_EVENT_THRESH, na.rm = TRUE),
+    n_above_high  = sum(p95 > TURB_HIGH_THRESH,  na.rm = TRUE),
+    pct_above_event = round(100 * n_above_event / n(), 1),
+    pct_above_high  = round(100 * n_above_high  / n(), 1)
+  )
+```
+
+---
+
+# Event Detection
+
+Events are defined as contiguous runs of days where `p95 > TURB_EVENT_THRESH`.
+Each run is assigned a unique event ID, and its regime type is determined by
+the majority regime during the event.
+
+```{r event-detection}
+events_raw <- train_data %>%
+  arrange(date) %>%
+  mutate(
+    is_event = p95 > TURB_EVENT_THRESH,
+    # Assign run-length IDs; an event starts when is_event switches from FALSE to TRUE
+    run_id   = cumsum(!is_event | (is_event & lag(!is_event, default = TRUE)))
+  ) %>%
+  filter(is_event) %>%
+  group_by(run_id) %>%
+  summarise(
+    event_start    = min(date),
+    event_end      = max(date),
+    event_duration = as.integer(difftime(max(date), min(date), units = "days")) + 1L,
+    peak_p95       = max(p95, na.rm = TRUE),
+    mean_p95       = mean(p95, na.rm = TRUE),
+    peak_q_cfs     = max(canyon_mouth_cfs, na.rm = TRUE),
+    mean_q_cfs     = mean(canyon_mouth_cfs, na.rm = TRUE),
+    peak_doy       = doy[which.max(p95)],
+    majority_regime = names(sort(table(regime), decreasing = TRUE))[1],
+    is_high_turb   = any(p95 > TURB_HIGH_THRESH),
+    .groups = "drop"
+  ) %>%
+  filter(event_duration >= MIN_EVENT_DAYS)
+
+cat("Events detected:", nrow(events_raw), "\n")
+cat("High-turbidity events (>", TURB_HIGH_THRESH, "NTU):",
+    sum(events_raw$is_high_turb), "\n")
+```
+
+```{r event-typing}
+# Classify event type based on peak DOY and majority regime
+turbidity_events <- events_raw %>%
+  mutate(
+    event_type = case_when(
+      majority_regime == "snowmelt"   ~ "snowmelt",
+      majority_regime == "convective" ~ "convective",
+      .default = "baseflow/other"
+    ),
+    event_type = factor(event_type,
+                        levels = c("snowmelt", "convective", "baseflow/other"))
+  ) %>%
+  mutate(event_id = row_number(), .before = event_start)
+
+turbidity_events %>%
+  count(event_type) %>%
+  mutate(pct = round(100 * n / sum(n), 1))
+```
+
+---
+
+# Event Summary by Year
+
+```{r events-per-year}
+turbidity_events %>%
+  mutate(year = year(event_start)) %>%
+  count(year, event_type) %>%
+  pivot_wider(names_from = event_type, values_from = n, values_fill = 0) %>%
+  print(n = Inf)
+```
+
+---
+
+# Event Timeline
+
+```{r event-timeline, fig.dim = c(12, 5)}
+train_data %>%
+  left_join(
+    turbidity_events %>%
+      select(event_start, event_end, event_type) %>%
+      mutate(date = map2(event_start, event_end, seq.Date, by = "day")) %>%
+      unnest(date) %>%
+      select(date, event_type),
+    by = "date"
+  ) %>%
+  ggplot(aes(x = date, y = p95)) +
+  geom_line(color = "grey60", linewidth = 0.3) +
+  geom_point(aes(color = event_type), size = 0.8, na.rm = TRUE) +
+  scale_color_manual(
+    values = c(snowmelt = "#2166ac", convective = "#d73027", "baseflow/other" = "#b2df8a"),
+    na.value = "grey80"
+  ) +
+  geom_hline(yintercept = TURB_EVENT_THRESH, linetype = "dashed",
+             color = "orange", linewidth = 0.5) +
+  geom_hline(yintercept = TURB_HIGH_THRESH,  linetype = "dashed",
+             color = "red",    linewidth = 0.5) +
+  scale_y_log10() +
+  theme_bw() +
+  labs(title = "Daily p95 turbidity — event periods coloured by type (2010–2023)",
+       x = NULL, y = "p95 NTU (log scale)", color = "Event type")
+```
+
+---
+
+# Seasonal Event Distribution
+
+```{r seasonal-distribution, fig.dim = c(8, 4)}
+turbidity_events %>%
+  ggplot(aes(x = peak_doy, fill = event_type)) +
+  geom_histogram(bins = 36, position = "stack") +
+  scale_fill_manual(
+    values = c(snowmelt = "#2166ac", convective = "#d73027", "baseflow/other" = "#b2df8a")
+  ) +
+  theme_bw() +
+  labs(title = "Seasonal distribution of turbidity events (peak DOY)",
+       x = "Day of year (event peak)", y = "Count", fill = "Event type")
+```
+
+---
+
+# Save Event Catalog
+
+```{r save}
+out_dir <- here("data/derived/models/turbidity_forecast")
+write_parquet(turbidity_events,
+              file.path(out_dir, "turbidity_event_catalog.parquet"))
+
+cat("Saved:", file.path(out_dir, "turbidity_event_catalog.parquet"), "\n")
+cat("Events:", nrow(turbidity_events), "\n")
+```

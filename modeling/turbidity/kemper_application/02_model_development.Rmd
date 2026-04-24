@@ -1,0 +1,716 @@
+---
+title: "02_model_development — FC Intake Turbidity (Kemper Method)"
+author: "ROSSyndicate"
+date: "`r Sys.Date()`"
+output: html
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Purpose
+
+This script applies the Kemper et al. (2025) turbidity forecasting approach to
+the Fort Collins Intake turbidity and Canyon Mouth discharge data prepared in
+`01_data_prep.Rmd`. Data are at **hourly** resolution (flow-weighted turbidity
+aggregated from 15-min SCADA data, hourly discharge from CDSSR telemetry).
+
+Two models are developed (analogous to Kemper's Quantile-Coldbrook and
+LightGBM-Coldbrook models):
+
+1. **Quantile-FC** — Median quantile regression of log(turbidity) on
+log(Q) + log²(Q), following Mukundan et al. (2018) / Wang et al. (2021).
+Simple, interpretable, single-predictor model.
+
+2. **LightGBM-FC** — Gradient-boosted decision tree using all antecedent
+discharge predictors. Uses backwards variable selection and expanding-
+window cross-validation for hyperparameter tuning.
+
+Because only one flow station is available, there is no network-model
+equivalent (LightGBM-Network).
+
+Standard k-fold cross-validation is inappropriate here due to temporal autocorrelation and
+explicit lag predictors (e.g., antecedent discharge features) — randomly shuffling folds
+would allow training data to be temporally "after" validation data, leaking future information.
+Instead, LightGBM variable selection and hyperparameter tuning use expanding-window
+(forward-chaining) cross-validation, which respects temporal ordering:
+
+Variable selection (expanding window, 2 folds):
+- WY2012–WY2020 train → WY2021 validate
+- WY2012–WY2021 train → WY2022 validate
+
+Hyperparameter tuning (expanding window, 3 folds):
+- WY2012–WY2019 train → WY2020 validate
+- WY2012–WY2020 train → WY2021 validate
+- WY2012–WY2021 train → WY2022 validate
+
+The final models are retrained on WY2011–WY2022 (training + validation) before
+evaluation on the held-out test period (WY2023–WY2025).
+
+################################################################################
+
+
+```{r packages}
+library(here)
+library(tidyverse)
+library(arrow)
+library(crayon)
+
+### Modeling
+library(quantreg)
+library(hydroGOF)
+library(lightgbm)
+
+### Tuning (tidymodels stack)
+library(tidymodels)
+library(bonsai)
+```
+
+### Load prepared data
+
+```{r load-data}
+intake_turbidity_plus_drivers_clean <- read_parquet(here("data/derived/models/turbidity_forecast",
+                                                         "intake_turbidity_plus_drivers_clean_v2026-03-25.parquet"))
+```
+
+
+# Helper functions
+
+```{r helpers}
+
+#### Decompose KGE into correlation, bias, and variability components
+#### (Gupta et al. 2009, https://doi.org/10.1016/j.jhydrol.2009.08.003)
+
+decompose_kge <- function(sim, obs) {
+  r <- cor(sim, obs, method = "pearson", use = "pairwise.complete.obs")
+  bias <- mean(sim, na.rm = TRUE) / mean(obs, na.rm = TRUE)
+  variability <- sd(sim, na.rm = TRUE)   / sd(obs, na.rm = TRUE)
+  
+  kge_manual <- 1 - sqrt((r - 1)^2 + (variability - 1)^2 + (bias - 1)^2)
+  
+  tibble(r, variability, bias, kge_manual)
+}
+
+
+#### Compute a standard suite of model performance metrics
+
+error_estimator <- function(pred, obs, model_name) {
+  raw_err <- pred - obs
+  abs_err <- abs(raw_err)
+  sqr_err <- raw_err^2
+  pct_err <- abs_err / obs
+  
+  tibble(
+    model = model_name,
+    rmse = sqrt(mean(sqr_err, na.rm = TRUE)),
+    mae = mean(abs_err,  na.rm = TRUE),
+    mape = mean(pct_err,  na.rm = TRUE),
+    nse = NSE(pred, obs),
+    kge = KGE(pred, obs),
+    pbias = pbias(pred, obs),
+    corr = cor(pred, obs, use = "complete.obs")
+  ) %>%
+    bind_cols(decompose_kge(pred, obs))
+}
+```
+
+
+# Data Splits
+
+```{r splits}
+
+#### Training data (WY2011–WY2021)
+intake_train <- intake_turbidity_plus_drivers_clean %>%
+  filter(water_year >= 2011, water_year <= 2021)
+
+#### Validation data (WY2022)
+intake_valid <- intake_turbidity_plus_drivers_clean %>%
+  filter(water_year == 2022)
+
+#### Test data (WY2023–WY2025)
+intake_test  <- intake_turbidity_plus_drivers_clean %>%
+  filter(water_year >= 2023)
+
+#### Training + validation combined (for final model training before test eval)
+intake_train_full <- intake_turbidity_plus_drivers_clean %>%
+  filter(water_year <= 2022)
+
+cat("Train rows:", nrow(intake_train),
+    "| Valid rows:", nrow(intake_valid),
+    "| Test rows:", nrow(intake_test), "\n")
+```
+
+---
+
+# Model 1: Quantile Regression (Quantile-FC)
+
+```{r qqm-build}
+
+################################################################################
+#### Median (tau = 0.5) quantile regression of log10(turbidity) on
+#### log10(Q) and log10²(Q).
+####
+#### Model form (Mukundan et al. 2018 / Wang et al. 2021):
+####   log10(T) = β0 + β1·log10(Q) + β2·log10²(Q)
+####
+#### Trained on the full training+validation dataset (WY2011–WY2022)
+#### so that the test evaluation uses data the model has never seen.
+################################################################################
+
+#### Set up the tau we care about (p75)
+
+qqm_taus <- tibble(tau = 0.75) %>%
+  bind_cols(.,
+            intake_train_full %>%
+              select(log_observed_turbidity,
+                     log_observed_flow,
+                     log_squared_observed_flow) %>%
+              filter(if_all(everything(), ~ is.finite(.x))) %>%
+              nest()
+  )
+
+#### Fit quantile regression at tau = 0.75
+
+qqm_raw <- qqm_taus %>%
+  mutate(model = map2(data, tau,
+                      ~ rq(log_observed_turbidity ~ 1 +
+                             log_observed_flow + log_squared_observed_flow,
+                           data = .x,
+                           tau  = .y)))
+
+#### Extract coefficients
+
+qqm_coefficients <- qqm_raw %>%
+  mutate(
+    beta0 = map_dbl(model, ~ .x$coefficients[[1]]),
+    beta1 = map_dbl(model, ~ .x$coefficients[[2]]),
+    beta2 = map_dbl(model, ~ .x$coefficients[[3]])
+  ) %>%
+  select(tau, beta0, beta1, beta2)
+
+print(qqm_coefficients)
+```
+
+```{r qqm-smearing}
+
+#### Predict on training+validation data to estimate the Duan smearing factor.
+#### The smearing factor corrects for the systematic underestimation that arises
+#### when back-transforming from log scale (Duan 1983).
+
+qqm_train_pred <- qqm_raw %>%
+  mutate(data = map2(data, model,
+                     ~ mutate(.x,
+                              log_pred_turb = .y$coefficients[[1]] +
+                                .y$coefficients[[2]] * log_observed_flow +
+                                .y$coefficients[[3]] * log_squared_observed_flow))) %>%
+  unnest(data)
+
+D_qqm <- qqm_train_pred %>%
+  mutate(log_resids = 10^(log_pred_turb - log_observed_turbidity)) %>%
+  summarise(D = mean(log_resids, na.rm = TRUE)) %>%
+  pull(D)
+
+cat("Duan smearing factor (D_qqm):", round(D_qqm, 4), "\n")
+```
+
+```{r qqm-test-predict}
+
+#### Predict on test data
+
+qqm_test_pred <- intake_test %>%
+  mutate(
+    log_pred_turb  = qqm_coefficients$beta0 +
+      qqm_coefficients$beta1 * log_observed_flow +
+      qqm_coefficients$beta2 * log_squared_observed_flow,
+    pred_turb_fnu  = (10^log_pred_turb) * D_qqm
+  )
+```
+
+```{r qqm-evaluate}
+
+#### Evaluate quantile model on test data
+
+qqm_stats <- error_estimator(
+  pred       = qqm_test_pred$pred_turb_fnu,
+  obs        = qqm_test_pred$fw_mean_observed_turbidity,
+  model_name = "Quantile-FC"
+)
+
+print(qqm_stats)
+```
+
+```{r qqm-plot, fig.width=10, fig.height=4}
+
+#### Time series plot of test-period predictions vs. observations
+#### Aggregated to daily: observed p75 vs. predicted mean (tau = 0.75 model)
+
+qqm_test_pred %>%
+  mutate(date = as.Date(dateTime)) %>%
+  group_by(date) %>%
+  summarise(
+    obs_p75  = quantile(fw_mean_observed_turbidity, 0.75, na.rm = TRUE),
+    pred_mean = mean(pred_turb_fnu, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(cols = c(obs_p75, pred_mean),
+               names_to = "series", values_to = "turbidity") %>%
+  mutate(series = recode(series,
+                         obs_p75   = "Observed (daily p75)",
+                         pred_mean = "Quantile-FC (daily mean)")) %>%
+  ggplot(aes(x = date, y = turbidity, color = series)) +
+  geom_line(linewidth = 0.5, alpha = 0.8) +
+  scale_color_manual(values = c("Observed (daily p75)"      = "black",
+                                "Quantile-FC (daily mean)"  = "firebrick")) +
+  labs(title = "Quantile-FC: Test Period Predictions vs. Observations (daily)",
+       x = NULL, y = "Turbidity (FNU)", color = NULL) +
+  theme_bw() +
+  theme(legend.position = "bottom")
+```
+
+
+# Model 2: LightGBM-FC
+
+## Variable Selection
+
+```{r lgbm-predictor-setup}
+
+################################################################################
+#### Build the full predictor matrix for backwards variable selection.
+#### We include all antecedent discharge features plus day-of-year, month,
+#### and water_year (as an integer to capture long-term trends).
+#### The response is log10(turbidity).
+################################################################################
+
+#### All candidate predictors (drop raw/non-predictor columns)
+
+lgbm_predictors <- intake_turbidity_plus_drivers_clean %>%
+  select(
+    log_observed_turbidity,
+    water_year,
+    hour, doy, month,
+    log_observed_flow,
+    log_squared_observed_flow,
+    six_hour_lag_log_q,
+    mean_prior_daily_log_q,
+    mean_prior_weekly_log_q,
+    mean_prior_monthly_log_q,
+    max_prior_monthly_log_q,
+    max_prior_threemonth_log_q,
+    max_prior_sixmonth_log_q,
+    max_prior_annual_q,
+    log_limb, dq_q,
+    time_since_3month_peak,
+    time_since_6month_peak,
+    time_since_annual_peak
+  ) %>%
+  mutate(water_year2 = water_year) %>%  # allow water_year to be a predictor
+  filter(is.finite(log_observed_turbidity))  # drop zero-turbidity rows (log10(0) = -Inf)
+# while keeping it for train/test splits
+```
+
+```{r lgbm-varsel, eval=FALSE}
+
+################################################################################
+#### Backwards variable selection.
+#### Iteratively train LightGBM with default hyperparameters,
+#### calculate feature importance (mean Gain), remove the least important
+#### feature, and repeat. Records NSE, KGE, and PBIAS for each iteration
+#### across an expanding validation window (WY2019→2021, WY2020→2022).
+################################################################################
+
+model_stats_lgbm <- list()
+lgbm_var_imp <- list()
+vars_list <- list()
+all_model_stats <- list()
+
+#### Default LightGBM hyperparameters for variable selection phase
+
+lgbm_default_params <- list(
+  objective = "regression",
+  num_leaves = 31L,
+  learning_rate = 0.1,
+  min_data_in_leaf = 20L,
+  num_threads = 4L,
+  verbose = -1L
+)
+
+
+for (i in seq_len(ncol(lgbm_predictors) - 2L)) {  # -2 for response + water_year2
+  
+  run <- paste0("run", i)
+  cat(cyan("\nVariable Selection Run", i,
+           "| Predictors remaining:",
+           ncol(lgbm_predictors) - 2L, "\n"))
+  
+  for (j in 2021:2022) {
+    
+    cat(yellow("  Validating on WY", j, "\n"))
+    
+    train_yrs <- seq(2012, j - 1L, 1L)
+    
+    predictors_train <- lgbm_predictors %>%
+      filter(water_year %in% train_yrs)
+    
+    predictors_test <- lgbm_predictors %>%
+      filter(water_year == j) %>%
+      select(colnames(lgbm_predictors))
+    
+    #### Predictor matrix (drop response + water_year control columns)
+    preds_mat <- data.matrix(predictors_train %>%
+                               select(!c(log_observed_turbidity,
+                                         water_year,
+                                         water_year2)))
+    response_vec <- predictors_train$log_observed_turbidity
+    
+    lgbm_train_ds <- lgb.Dataset(preds_mat, label = response_vec)
+    
+    test_mat <- data.matrix(predictors_test %>%
+                              select(!c(log_observed_turbidity,
+                                        water_year,
+                                        water_year2)))
+    
+    #### Train
+    set.seed(913)
+    lgbm_mod <- lgb.train(lgbm_default_params,
+                          data = lgbm_train_ds,
+                          nrounds = 100L,
+                          verbose = -1L)
+    
+    #### Predict + smear
+    log_pred_train <- predict(lgbm_mod, newdata = preds_mat)
+    smear_d <- mean(10^(response_vec - log_pred_train), na.rm = TRUE)
+    log_pred <- predict(lgbm_mod, newdata = test_mat)
+    pred_turb <- (10^log_pred) * smear_d
+    obs_turb <- 10^predictors_test$log_observed_turbidity
+    
+    #### Performance
+    stats_row <- error_estimator(pred_turb, obs_turb,
+                                 paste0(run, "_WY", j))
+    
+    model_stats_lgbm[[paste0(run, "_WY", j)]] <- stats_row
+    
+    #### Feature importance (mean Gain)
+    imp <- lgb.importance(lgbm_mod, percentage = TRUE) %>%
+      as_tibble() %>%
+      mutate(run = run, valid_wy = j)
+    
+    lgbm_var_imp[[paste0(run, "_WY", j)]] <- imp
+    
+  }  # end year loop
+  
+  #### Identify and drop least important feature
+  mean_imp <- bind_rows(lgbm_var_imp[grep(run, names(lgbm_var_imp))]) %>%
+    group_by(Feature) %>%
+    summarise(mean_gain = mean(Gain, na.rm = TRUE)) %>%
+    arrange(mean_gain)
+  
+  vars_list[[run]] <- lgbm_predictors %>%
+    select(!c(log_observed_turbidity, water_year, water_year2)) %>%
+    colnames()
+  
+  all_model_stats[[run]] <- bind_rows(model_stats_lgbm[grep(run,
+                                                            names(model_stats_lgbm))])
+  
+  #### Drop the least important feature for the next iteration
+  drop_var <- mean_imp$Feature[[1]]
+  cat(red("    Dropping:", drop_var, "\n"))
+  
+  lgbm_predictors <- lgbm_predictors %>%
+    select(-all_of(drop_var))
+  
+  #### Stop if only one predictor remains
+  if ((ncol(lgbm_predictors) - 2L) <= 1L) break
+  
+}  # end variable-selection loop
+
+all_varsel_stats <- bind_rows(all_model_stats, .id = "run")
+```
+
+```{r lgbm-select-model, eval=FALSE}
+
+################################################################################
+#### Identify the best model from variable selection.
+#### Selection criterion (following Kemper et al.):
+####   - NSE > 0 (better than mean model)
+####   - KGE > 0
+####   - |PBIAS| < 25%
+#### Among models meeting all three criteria, choose the one with the fewest
+#### predictors (parsimony) and the highest mean KGE.
+################################################################################
+
+#### Summarise performance across validation years for each run
+
+varsel_summary <- all_varsel_stats %>%
+  group_by(run) %>%
+  summarise(
+    mean_nse = mean(nse, na.rm = TRUE),
+    mean_kge = mean(kge, na.rm = TRUE),
+    mean_pbias = mean(pbias, na.rm = TRUE)
+  ) %>%
+  filter(mean_nse > 0, mean_kge > 0, abs(mean_pbias) < 25) %>%
+  arrange(desc(mean_kge))
+
+best_run <- varsel_summary$run[[1]]
+cat("Selected model run:", best_run, "\n")
+
+#### Retrieve the predictor list for the best model
+
+best_predictors <- vars_list[[best_run]]
+cat("Predictors in best model:", paste(best_predictors, collapse = ", "), "\n")
+```
+
+## Hyperparameter Tuning
+
+```{r lgbm-tune, eval=FALSE}
+
+################################################################################
+#### Tune LightGBM hyperparameters using an expanding-window design via
+#### tidymodels. Parameters tuned: min_n, num_leaves.
+#### Grid: 100-point max-entropy design over the search space.
+################################################################################
+
+#### Prepare data with only the selected predictors
+
+lgbm_tune_data <- intake_turbidity_plus_drivers_clean %>%
+  select(all_of(c("log_observed_turbidity", "water_year",
+                  best_predictors))) %>%
+  mutate(water_year2 = water_year)
+
+#### Build expanding-window train/validation splits
+#### WY2012–WY2019 train → WY2020 valid
+#### WY2012–WY2020 train → WY2021 valid
+#### WY2012–WY2021 train → WY2022 valid
+
+splits_list <- list()
+
+for (h in 2020:2022) {
+  train_d <- lgbm_tune_data %>%
+    filter(water_year >= 2012, water_year < h) %>%
+    select(!c(water_year, water_year2))
+  
+  valid_d <- lgbm_tune_data %>%
+    filter(water_year == h) %>%
+    select(!c(water_year, water_year2))
+  
+  k <- 2023 - h
+  splits_list[[k]] <- make_splits(train_d, assessment = valid_d)
+}
+
+tune_resamples <- manual_rset(splits_list, c("Split1", "Split2", "Split3"))
+
+#### Model recipe and spec
+
+tune_recipe <- recipe(
+  log_observed_turbidity ~ .,
+  data = lgbm_tune_data %>%
+    filter(water_year >= 2012, water_year < 2020) %>%
+    select(!c(water_year, water_year2))
+) %>%
+  prep()
+
+lgbm_spec <- boost_tree(
+  mode = "regression",
+  min_n = tune(),
+) %>%
+  set_engine("lightgbm",
+             objective = "rmse",
+             verbose = -1,
+             num_leaves = tune(),
+             num_threads = 4L)
+
+#### Parameter grid
+
+lgbm_params <- parameters(
+  min_n(c(2L, 60L), trans = NULL),
+  num_leaves(c(2L, 256L))
+)
+
+lgbm_grid <- grid_max_entropy(lgbm_params, size = 100)
+
+#### Workflow
+
+lgbm_wf <- workflow() %>%
+  add_model(lgbm_spec) %>%
+  add_formula(log_observed_turbidity ~ .)
+
+#### Tune
+
+set.seed(913)
+lgbm_tuned <- tune_grid(
+  object = lgbm_wf,
+  resamples = tune_resamples,
+  grid = lgbm_grid,
+  metrics = metric_set(rmse),
+  control = control_grid(verbose = TRUE)
+)
+
+#### Extract best hyperparameters
+
+rmse_scores <- lgbm_tuned %>%
+  show_best(metric = "rmse", n = 100) %>%
+  mutate(
+    mean_rmse_rank = dense_rank(mean),
+    se_rank = dense_rank(std_err),
+    combined_rank = mean_rmse_rank + se_rank
+  ) %>%
+  arrange(combined_rank)
+
+best_params <- rmse_scores %>% slice(1)
+cat("Best min_n:", best_params$min_n,
+    "| Best num_leaves:", best_params$num_leaves, "\n")
+```
+
+## Train Final LightGBM Model
+
+```{r lgbm-final-train, eval=FALSE}
+
+################################################################################
+#### Train the final LightGBM model on all data up to WY2022 using the
+#### selected predictors and tuned hyperparameters, then evaluate on WY2023+.
+################################################################################
+
+#### Prepare training and test matrices
+
+lgbm_final_train <- intake_train_full %>%
+  filter(water_year >= 2011) %>%
+  select(all_of(c(best_predictors, "log_observed_turbidity")))
+
+lgbm_final_test <- intake_test %>%
+  select(all_of(c(best_predictors, "log_observed_turbidity")))
+
+train_mat <- data.matrix(lgbm_final_train %>%
+                           select(!log_observed_turbidity))
+train_label <- lgbm_final_train$log_observed_turbidity
+
+test_mat_final <- data.matrix(lgbm_final_test %>%
+                                select(!log_observed_turbidity))
+
+lgbm_ds <- lgb.Dataset(train_mat, label = train_label)
+
+#### Final hyperparameters (replace with tuned values after running tune chunk)
+
+final_params <- list(
+  objective = "regression",
+  num_leaves = best_params$num_leaves,   # from tuning
+  min_data_in_leaf = best_params$min_n,        # from tuning
+  learning_rate = 0.1,
+  num_threads = 4L,
+  verbose = -1L
+)
+
+set.seed(913)
+lgbm_final_model <- lgb.train(final_params,
+                              data = lgbm_ds,
+                              nrounds = 100L)
+
+#### Smearing factor from training data
+
+log_pred_train <- predict(lgbm_final_model, data = train_mat)
+D_lgbm <- mean(10^(train_label - log_pred_train), na.rm = TRUE)
+cat("Duan smearing factor (D_lgbm):", round(D_lgbm, 4), "\n")
+
+#### Predict on test data
+
+log_pred_test <- predict(lgbm_final_model, data = test_mat_final)
+pred_turb_lgbm <- (10^log_pred_test) * D_lgbm
+obs_turb_test <- 10^lgbm_final_test$log_observed_turbidity
+
+#### Save the model
+
+lgb.save(lgbm_final_model,
+         filename = here("modeling/turbidity/kemper_application/lgbm_fc_model.txt"))
+```
+
+## Evaluate LightGBM Model
+
+```{r lgbm-evaluate, eval=FALSE}
+
+lgbm_stats <- error_estimator(pred_turb_lgbm, obs_turb_test, "LightGBM-FC")
+print(lgbm_stats)
+
+```
+
+```{r lgbm-variable-importance, eval=FALSE}
+
+#### Variable importance plot
+
+lgb.importance(lgbm_final_model, percentage = TRUE) %>%
+  as_tibble() %>%
+  slice_max(Gain, n = 15) %>%
+  ggplot(aes(x = reorder(Feature, Gain), y = Gain)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "LightGBM-FC: Top 15 Features by Mean Gain",
+       x = NULL, y = "Mean Gain (%)") +
+  theme_bw()
+```
+
+```{r lgbm-plot, eval=FALSE, fig.width=10, fig.height=4}
+
+#### Test period time series comparison
+
+tibble(
+  dateTime  = intake_test$dateTime,
+  observed  = obs_turb_test,
+  predicted = pred_turb_lgbm
+) %>%
+  pivot_longer(cols = c(observed, predicted),
+               names_to = "series", values_to = "turbidity") %>%
+  ggplot(aes(x = dateTime, y = turbidity, color = series)) +
+  geom_line(linewidth = 0.5, alpha = 0.8) +
+  scale_y_log10() +
+  scale_color_manual(values = c("observed" = "black",
+                                "predicted" = "steelblue")) +
+  labs(title = "LightGBM-FC: Test Period Predictions vs. Observations",
+       x = NULL, y = "Turbidity (FNU, log scale)", color = NULL) +
+  theme_bw() +
+  theme(legend.position = "bottom")
+```
+
+---
+
+# Model Comparison
+
+```{r compare, eval=FALSE}
+
+################################################################################
+#### Side-by-side performance summary for both models on the test period.
+################################################################################
+
+model_comparison <- bind_rows(qqm_stats, lgbm_stats) %>%
+  select(model, rmse, mae, nse, kge, pbias, corr, r, variability, bias)
+
+print(model_comparison)
+```
+
+
+```{r scatter-compare, eval=FALSE, fig.width=8, fig.height=4}
+#### Observed vs. predicted scatter for both models
+
+qqm_scatter <- tibble(
+  model = "Quantile-FC",
+  observed = intake_test$fw_mean_observed_turbidity,
+  predicted = qqm_test_pred$pred_turb_fnu
+)
+
+lgbm_scatter <- tibble(
+  model = "LightGBM-FC",
+  observed = obs_turb_test,
+  predicted = pred_turb_lgbm
+)
+
+bind_rows(qqm_scatter, lgbm_scatter) %>%
+  ggplot(aes(x = observed, y = predicted, color = model)) +
+  geom_point(alpha = 0.3, size = 0.8) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray40") +
+  scale_x_log10() +
+  scale_y_log10() +
+  scale_color_manual(values = c("Quantile-FC" = "firebrick",
+                                "LightGBM-FC" = "steelblue")) +
+  facet_wrap(~ model) +
+  labs(title = "Observed vs. Predicted Turbidity — Test Period (WY2023–2025)",
+       x = "Observed (FNU)", y = "Predicted (FNU)") +
+  theme_bw() +
+  theme(legend.position = "none")
+```

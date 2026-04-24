@@ -1,0 +1,493 @@
+---
+title: "00_functions — Daily p95 Turbidity Forecast (Modified Kemper)"
+author: "ROSSyndicate"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Purpose
+
+Helper functions shared across all scripts in the modified Kemper daily p95
+turbidity forecasting workflow. Source this file at the top of each script via
+`knitr::knit("00_functions.Rmd", tangle = TRUE)` or inline with
+`source(knitr::purl("00_functions.Rmd", quiet = TRUE))`.
+
+Key differences from the original Kemper `00_functions.Rmd`:
+- All functions operate on **daily** data (not hourly).
+- Flow is in CFS (from CDSSR CLAFTCCO); no CMS conversion needed.
+- Target is **daily p95 turbidity (NTU)**, not instantaneous FNU.
+- Snow/melt features (`melt_rate_calculator`) are added for the CLP environment.
+- GAM cross-validation replaces the quantile predictor functions.
+
+---
+
+```{r packages}
+library(tidyverse)
+library(slider)
+library(mgcv)
+library(hydroGOF)
+library(lightgbm)
+library(tidymodels)
+library(bonsai)
+```
+
+---
+
+# Antecedent Flow Feature Builder
+
+```{r antecedent_Q_maker}
+
+#### antecedent_Q_maker
+####
+#### Given a daily tibble with columns `date` and `canyon_mouth_cfs`,
+#### computes the full suite of antecedent discharge features used as
+#### predictors in both the GAM and LightGBM models.
+####
+#### Adapted from kemper_application/01_data_prep.Rmd antecedent calculations,
+#### but simplified to daily resolution.
+####
+#### Returns the input tibble with additional columns appended.
+
+antecedent_Q_maker <- function(df) {
+
+  df %>%
+    arrange(date) %>%
+    mutate(
+      # Log-transform (log1p guards against Q = 0)
+      log_q               = log1p(canyon_mouth_cfs),
+      log_q_sq            = log_q^2,
+
+      # Day-over-day log change (hydrograph limb indicator)
+      # Positive = rising, negative = falling
+      log_limb            = log_q - lag(log_q, 1),
+
+      # Normalised flow change: ΔQ / Q (Kemper eq. 8)
+      dq_q                = (canyon_mouth_cfs - lag(canyon_mouth_cfs, 1)) /
+                              lag(canyon_mouth_cfs, 1),
+
+      # Raw flow change over 1 and 2 days
+      deltaQ_24h          = canyon_mouth_cfs - lag(canyon_mouth_cfs, 1),
+      deltaQ_48h          = canyon_mouth_cfs - lag(canyon_mouth_cfs, 2),
+
+      # Rolling means (right-aligned, current day included)
+      mean_q_7d           = slide_dbl(canyon_mouth_cfs, mean,
+                                      .before = 6,  .complete = TRUE),
+      mean_q_30d          = slide_dbl(canyon_mouth_cfs, mean,
+                                      .before = 29, .complete = TRUE),
+      mean_q_90d          = slide_dbl(canyon_mouth_cfs, mean,
+                                      .before = 89, .complete = TRUE),
+
+      # Rolling maxima
+      max_q_30d           = slide_dbl(canyon_mouth_cfs, max,
+                                      .before = 29, .complete = TRUE),
+      max_q_90d           = slide_dbl(canyon_mouth_cfs, max,
+                                      .before = 89, .complete = TRUE),
+      max_q_365d          = slide_dbl(canyon_mouth_cfs, max,
+                                      .before = 364, .complete = TRUE)
+    ) %>%
+    # Days since each rolling-maximum peak
+    group_by(year = lubridate::year(date)) %>%
+    mutate(
+      time_since_annual_peak = as.numeric(date - date[which.max(max_q_365d)])
+    ) %>%
+    ungroup() %>%
+    mutate(
+      time_since_30d_peak = as.numeric(
+        date - date[cumsum(!is.na(max_q_30d)) %>%
+                      match(seq_along(date))]
+      ),
+      time_since_90d_peak = as.numeric(
+        date - date[cumsum(!is.na(max_q_90d)) %>%
+                      match(seq_along(date))]
+      )
+    )
+}
+```
+
+---
+
+# Snowmelt Rate Calculator
+
+```{r melt_rate_calculator}
+
+#### melt_rate_calculator
+####
+#### Given a tibble with columns `date` and `swe_pc1` (PCA score from SNOTEL
+#### network), computes forward-difference melt rates at 7- and 14-day windows.
+####
+#### Sign convention (confirmed from PCA rotation in intake_turbidity_forecast_poc.Rmd):
+####   melt_rate_7d > 0  →  active snowpack depletion (ablation)
+####   melt_rate_7d < 0  →  snowpack accumulation
+####
+#### Returns the input tibble with `melt_rate_7d` and `melt_rate_14d` appended.
+
+melt_rate_calculator <- function(df) {
+
+  df %>%
+    arrange(date) %>%
+    mutate(
+      swe_pc1_lag7  = lag(swe_pc1, 7),
+      swe_pc1_lag14 = lag(swe_pc1, 14),
+      melt_rate_7d  = (swe_pc1_lag7  - swe_pc1) / 7,
+      melt_rate_14d = (swe_pc1_lag14 - swe_pc1) / 14
+    ) %>%
+    select(-swe_pc1_lag7, -swe_pc1_lag14)
+}
+```
+
+---
+
+# Regime Classifier
+
+```{r regime_classifier}
+
+#### regime_classifier
+####
+#### Classifies each row as one of three turbidity-generation regimes.
+#### Classification mirrors the logic in intake_turbidity_forecast_poc.Rmd
+#### but is exposed as a function for reuse in feature engineering and
+#### forecast preparation.
+####
+#### Priority: convective > snowmelt > baseflow
+####
+#### Parameters (thresholds can be overridden):
+####   PRECIP_THRESH              daily precip (in) for binary event flag
+####   CONVECTIVE_PRECIP_THRESH   3-day rolling precip (in) for antecedent wetness
+####   MELT_THRESH                melt_rate_7d threshold for active snowmelt
+####
+#### Required columns: doy, precip_event, precip_3day, melt_rate_7d
+#### Returns the input tibble with a `regime` factor column appended.
+
+PRECIP_THRESH            <- 0.2
+CONVECTIVE_PRECIP_THRESH <- 0.5
+MELT_THRESH              <- 0
+
+regime_classifier <- function(df,
+                              precip_thresh   = PRECIP_THRESH,
+                              conv_precip_3d  = CONVECTIVE_PRECIP_THRESH,
+                              melt_thresh     = MELT_THRESH) {
+  df %>%
+    mutate(
+      regime = case_when(
+        # Convective: June–October (DOY 150–300) with precip trigger
+        doy %in% 150:300 &
+          (precip_event == 1 | precip_3day > conv_precip_3d) ~ "convective",
+        # Snowmelt: Jan–late July (DOY 1–210), active melt, no precip trigger
+        !is.na(melt_rate_7d) &
+          melt_rate_7d > melt_thresh &
+          doy %in% 1:210 ~ "snowmelt",
+        # Baseflow: everything else
+        .default = "baseflow"
+      ),
+      regime = factor(regime, levels = c("snowmelt", "convective", "baseflow"))
+    )
+}
+```
+
+---
+
+# GAM Cross-Validation
+
+```{r run_gam_cv_fold}
+
+#### run_gam_cv_fold
+####
+#### Fits persistence, global GAM, and regime-specific GAMs for one CV fold.
+#### Adapted directly from intake_turbidity_forecast_poc.Rmd `run_cv_fold()`.
+####
+#### Arguments:
+####   k            name of the fold in cv_folds list
+####   model_data   full modelling tibble (must include MODEL_COLS)
+####   cv_folds     named list of year vectors (held-out validation years per fold)
+####   TRAIN_CV_YEARS  integer vector of all training+CV years
+####   MODEL_COLS   character vector of required column names
+####   GLOBAL_FORMULA   formula for global GAM
+####   REGIME_FORMULAS  named list of formulas (snowmelt, convective, baseflow)
+####   lead          integer lead time (1, 2, or 3)
+####
+#### Returns a tibble of per-observation predictions for the validation set.
+
+run_gam_cv_fold <- function(k,
+                            model_data,
+                            cv_folds,
+                            TRAIN_CV_YEARS,
+                            MODEL_COLS,
+                            GLOBAL_FORMULA,
+                            REGIME_FORMULAS,
+                            lead = 1) {
+
+  target_col  <- paste0("target_p95_t", lead)
+  val_yrs     <- cv_folds[[k]]
+  train_yrs   <- setdiff(TRAIN_CV_YEARS, val_yrs)
+
+  train <- model_data %>%
+    filter(year %in% train_yrs) %>%
+    drop_na(all_of(c(MODEL_COLS, target_col)))
+
+  val <- model_data %>%
+    filter(year %in% val_yrs) %>%
+    drop_na(all_of(c(MODEL_COLS, target_col)))
+
+  if (nrow(val) == 0) return(NULL)
+
+  # Rename target to generic `target_p95` so formulas work for any lead
+  train <- train %>% rename(target_p95 = !!target_col)
+  val   <- val   %>% rename(target_p95 = !!target_col)
+
+  # Global GAM
+  fit_global   <- gam(GLOBAL_FORMULA, data = train,
+                      family = Gamma(link = "log"), method = "REML")
+  global_pred  <- as.numeric(predict(fit_global, newdata = val,
+                                     type = "response"))
+
+  # Regime GAMs — fit on all-regime training data, predict by regime
+  regime_models <- map(REGIME_FORMULAS, function(f) {
+    gam(f, data = train, family = Gamma(link = "log"), method = "REML")
+  })
+
+  regime_pred <- val %>%
+    select(date, regime, target_p95) %>%
+    mutate(
+      pred = map2_dbl(
+        as.character(regime), seq_len(n()),
+        ~ as.numeric(predict(regime_models[[.x]],
+                             newdata = val[.y, ],
+                             type = "response"))
+      )
+    )
+
+  tibble(
+    date       = val$date,
+    year       = val$year,
+    lead       = lead,
+    fold       = k,
+    regime     = val$regime,
+    observed   = val$target_p95,
+    persistence = val$p95,
+    global_pred = global_pred,
+    regime_pred = regime_pred$pred
+  )
+}
+```
+
+---
+
+# Error / Performance Metrics
+
+```{r error_estimator}
+
+#### error_estimator
+####
+#### Computes standard performance metrics for a model prediction vector.
+#### Copied and extended from kemper_application/02_model_development.Rmd.
+
+decompose_kge <- function(sim, obs) {
+  r          <- cor(sim, obs, method = "pearson", use = "pairwise.complete.obs")
+  bias       <- mean(sim, na.rm = TRUE) / mean(obs, na.rm = TRUE)
+  variability <- sd(sim, na.rm = TRUE) / sd(obs, na.rm = TRUE)
+  kge_manual <- 1 - sqrt((r - 1)^2 + (variability - 1)^2 + (bias - 1)^2)
+  tibble(r, variability, bias, kge_manual)
+}
+
+error_estimator <- function(pred, obs, model_name) {
+  raw_err <- pred - obs
+  abs_err <- abs(raw_err)
+  sqr_err <- raw_err^2
+  pct_err <- abs_err / obs
+
+  tibble(
+    model  = model_name,
+    rmse   = sqrt(mean(sqr_err, na.rm = TRUE)),
+    mae    = mean(abs_err,  na.rm = TRUE),
+    mape   = mean(pct_err,  na.rm = TRUE),
+    nse    = NSE(pred, obs),
+    kge    = KGE(pred, obs),
+    pbias  = pbias(pred, obs),
+    corr   = cor(pred, obs, use = "complete.obs")
+  ) %>%
+    bind_cols(decompose_kge(pred, obs))
+}
+```
+
+---
+
+# LightGBM Tuner
+
+```{r lgbm_tuner_daily}
+
+#### lgbm_tuner_daily
+####
+#### Backwards variable selection + hyperparameter tuning for daily LightGBM.
+#### Adapted from kemper_application/02_model_development.Rmd.
+####
+#### Variable selection: expanding-window CV over 2 folds
+####   WY2012–WY2020 train → WY2021 validate
+####   WY2012–WY2021 train → WY2022 validate
+####
+#### Hyperparameter tuning: expanding-window CV over 3 folds
+####   WY2012–WY2019 → WY2020, WY2012–WY2020 → WY2021, WY2012–WY2021 → WY2022
+####
+#### Arguments:
+####   df            daily tibble with `year` + all candidate predictors + log_p95
+####   all_preds     character vector of all candidate predictor column names
+####   response_col  name of the log-transformed response column (default: "log_p95")
+####
+#### Returns a list: $best_predictors, $best_params, $varsel_stats, $tune_scores
+
+lgbm_tuner_daily <- function(df,
+                             all_preds,
+                             response_col = "log_p95") {
+
+  lgbm_predictors <- df %>%
+    select(all_of(c(response_col, "year", all_preds))) %>%
+    mutate(year2 = year) %>%
+    filter(is.finite(.data[[response_col]]))
+
+  lgbm_default_params <- list(
+    objective    = "regression",
+    num_leaves   = 31L,
+    learning_rate = 0.1,
+    min_data_in_leaf = 20L,
+    num_threads  = 4L,
+    verbose      = -1L
+  )
+
+  model_stats_all <- list()
+  lgbm_var_imp    <- list()
+  vars_list       <- list()
+
+  # ── Backwards variable selection ─────────────────────────────────────────────
+  for (i in seq_len(ncol(lgbm_predictors) - 3L)) {  # -3: response, year, year2
+
+    run <- paste0("run", i)
+
+    for (j in 2021:2022) {
+
+      train_d <- lgbm_predictors %>%
+        filter(year >= 2012, year < j) %>%
+        select(!c(!!response_col, year, year2))
+
+      test_d  <- lgbm_predictors %>%
+        filter(year == j)
+
+      preds_mat    <- data.matrix(train_d)
+      response_vec <- lgbm_predictors %>%
+        filter(year >= 2012, year < j) %>%
+        pull(!!response_col)
+      test_mat     <- data.matrix(test_d %>%
+                                    select(!c(!!response_col, year, year2)))
+
+      lgbm_ds <- lgb.Dataset(preds_mat, label = response_vec)
+      set.seed(913)
+      lgbm_mod <- lgb.train(lgbm_default_params, data = lgbm_ds,
+                            nrounds = 100L, verbose = -1L)
+
+      # Smearing factor
+      smear_d   <- mean(10^(response_vec -
+                              predict(lgbm_mod, newdata = preds_mat)),
+                        na.rm = TRUE)
+      log_pred  <- predict(lgbm_mod, newdata = test_mat)
+      pred_turb <- (10^log_pred) * smear_d
+      obs_turb  <- 10^test_d[[response_col]]
+
+      stats_row <- error_estimator(pred_turb, obs_turb,
+                                   paste0(run, "_WY", j))
+      model_stats_all[[paste0(run, "_WY", j)]] <- stats_row
+
+      imp <- lgb.importance(lgbm_mod, percentage = TRUE) %>%
+        as_tibble() %>%
+        mutate(run = run, valid_wy = j)
+      lgbm_var_imp[[paste0(run, "_WY", j)]] <- imp
+    }
+
+    mean_imp <- bind_rows(lgbm_var_imp[grep(run, names(lgbm_var_imp))]) %>%
+      group_by(Feature) %>%
+      summarise(mean_gain = mean(Gain, na.rm = TRUE)) %>%
+      arrange(mean_gain)
+
+    vars_list[[run]] <- lgbm_predictors %>%
+      select(!c(!!response_col, year, year2)) %>%
+      colnames()
+
+    drop_var        <- mean_imp$Feature[[1]]
+    lgbm_predictors <- lgbm_predictors %>% select(-all_of(drop_var))
+
+    if ((ncol(lgbm_predictors) - 3L) <= 1L) break
+  }
+
+  varsel_stats <- bind_rows(model_stats_all, .id = "run") %>%
+    group_by(run) %>%
+    summarise(mean_nse   = mean(nse,   na.rm = TRUE),
+              mean_kge   = mean(kge,   na.rm = TRUE),
+              mean_pbias = mean(pbias, na.rm = TRUE)) %>%
+    filter(mean_nse > 0, mean_kge > 0, abs(mean_pbias) < 25) %>%
+    arrange(desc(mean_kge))
+
+  best_run        <- varsel_stats$run[[1]]
+  best_predictors <- vars_list[[best_run]]
+
+  # ── Hyperparameter tuning ─────────────────────────────────────────────────────
+  lgbm_tune_data <- df %>%
+    select(all_of(c(response_col, "year", best_predictors))) %>%
+    mutate(year2 = year) %>%
+    filter(is.finite(.data[[response_col]]))
+
+  splits_list <- list()
+  for (h in 2020:2022) {
+    train_d <- lgbm_tune_data %>%
+      filter(year >= 2012, year < h) %>%
+      select(!c(year, year2))
+    valid_d <- lgbm_tune_data %>%
+      filter(year == h) %>%
+      select(!c(year, year2))
+    splits_list[[2023 - h]] <- make_splits(train_d, assessment = valid_d)
+  }
+  tune_resamples <- manual_rset(splits_list, c("Split1", "Split2", "Split3"))
+
+  tune_recipe <- recipe(
+    as.formula(paste(response_col, "~ .")),
+    data = lgbm_tune_data %>%
+      filter(year >= 2012, year < 2020) %>%
+      select(!c(year, year2))
+  ) %>% prep()
+
+  lgbm_spec <- boost_tree(mode = "regression", min_n = tune()) %>%
+    set_engine("lightgbm", objective = "rmse", verbose = -1,
+               num_leaves = tune(), num_threads = 4L)
+
+  lgbm_grid <- grid_max_entropy(
+    parameters(min_n(c(2L, 60L), trans = NULL),
+               num_leaves(c(2L, 256L))),
+    size = 100
+  )
+
+  lgbm_wf <- workflow() %>%
+    add_model(lgbm_spec) %>%
+    add_formula(as.formula(paste(response_col, "~ .")))
+
+  set.seed(913)
+  lgbm_tuned <- tune_grid(lgbm_wf, resamples = tune_resamples,
+                          grid = lgbm_grid, metrics = metric_set(rmse),
+                          control = control_grid(verbose = FALSE))
+
+  tune_scores <- lgbm_tuned %>%
+    show_best(metric = "rmse", n = 100) %>%
+    mutate(mean_rmse_rank = dense_rank(mean),
+           se_rank        = dense_rank(std_err),
+           combined_rank  = mean_rmse_rank + se_rank) %>%
+    arrange(combined_rank)
+
+  best_params <- tune_scores %>% slice(1)
+
+  list(
+    best_predictors = best_predictors,
+    best_params     = best_params,
+    varsel_stats    = varsel_stats,
+    tune_scores     = tune_scores
+  )
+}
+```

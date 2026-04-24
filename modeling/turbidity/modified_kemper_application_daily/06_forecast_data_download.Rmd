@@ -1,0 +1,220 @@
+---
+title: "06_forecast_data_download — Daily p95 Turbidity Forecast (Modified Kemper)"
+author: "ROSSyndicate"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+library(here)
+library(tidyverse)
+library(lubridate)
+library(httr)
+library(jsonlite)
+library(arrow)
+
+source(here("src/hefs/get_hefs_ensembles.R"))
+source(here("src/hefs/get_hefs_gauges.R"))
+```
+
+# Purpose
+
+Download HEFS (Hydro-Ensemble Forecast System) ensemble streamflow forecasts
+for the Canyon Mouth gauge. HEFS serves as the operational discharge driver
+for turbidity forecasting, analogous to the National Water Model medium-range
+forecasts used by Kemper et al.
+
+HEFS API: https://api.water.noaa.gov/hefs/v1/docs/
+
+The Canyon Mouth gauge on the NWPS network is `COLOC070` (confirm in
+`01_data_discovery.Rmd` if this has changed). HEFS provides 30-member ensemble
+discharge forecasts at sub-daily timesteps; we aggregate to daily means.
+
+**Coverage target:** 2023-01-01 to present (or most recent available date).
+Earlier dates are not archived in the live HEFS API. For evaluation against
+training data (2010–2023), see `09_evaluate_performance.Rmd` — that script
+uses observed flows as a perfect-forecast benchmark.
+
+---
+
+# Constants
+
+```{r constants}
+# NWPS gauge ID for Canyon Mouth — confirm from 01_data_discovery.Rmd
+CANYON_MOUTH_HEFS_ID <- "COLOC070"
+
+# Download window
+HEFS_START_DATE <- as.Date("2023-01-01")
+HEFS_END_DATE   <- Sys.Date() - 1  # through yesterday
+
+# Output path
+OUT_PATH <- here("data/derived/models/turbidity_forecast/hefs_forecasts_raw.parquet")
+```
+
+---
+
+# Verify Gauge
+
+```{r verify-gauge}
+hefs_gauges <- get_hefs_gauges()
+
+hefs_gauges %>%
+  filter(lid == CANYON_MOUTH_HEFS_ID) %>%
+  select(lid, name, state, rfc) %>%
+  print()
+```
+
+---
+
+# Download HEFS Archive
+
+We loop over each forecast initialization date from `HEFS_START_DATE` to
+`HEFS_END_DATE`. HEFS updates once daily (around 12:00Z); we pull each day's
+forecast. Failed dates are silently skipped and logged.
+
+```{r download-hefs}
+all_dates <- seq.Date(HEFS_START_DATE, HEFS_END_DATE, by = "day")
+failed_dates <- character(0)
+
+# Check if a partial archive already exists and only download new dates
+if (file.exists(OUT_PATH)) {
+  existing <- read_parquet(OUT_PATH)
+  already_pulled <- unique(as.Date(existing$forecast_date))
+  remaining_dates <- all_dates[!all_dates %in% already_pulled]
+  cat("Existing archive covers", length(already_pulled), "dates.\n")
+  cat("Downloading", length(remaining_dates), "new dates...\n")
+} else {
+  existing <- NULL
+  remaining_dates <- all_dates
+  cat("No existing archive. Downloading", length(remaining_dates), "dates...\n")
+}
+
+new_forecasts <- map(remaining_dates, function(d) {
+  result <- tryCatch(
+    get_hefs_ensemble(ID = CANYON_MOUTH_HEFS_ID, date = d),
+    error = function(e) {
+      failed_dates <<- c(failed_dates, as.character(d))
+      NULL
+    }
+  )
+  if (!is.null(result)) result %>% mutate(init_date = d)
+  else NULL
+}) %>%
+  compact() %>%
+  bind_rows()
+
+if (nrow(new_forecasts) > 0) {
+  cat("Downloaded", nrow(new_forecasts), "new forecast rows.\n")
+} else {
+  cat("No new forecast data downloaded.\n")
+}
+
+if (length(failed_dates) > 0) {
+  cat("Failed dates:", paste(failed_dates, collapse = ", "), "\n")
+}
+```
+
+---
+
+# Aggregate to Daily
+
+HEFS returns sub-daily (typically 6-hourly) ensemble members. Aggregate to
+daily mean discharge per ensemble member per lead day.
+
+```{r aggregate-daily}
+if (nrow(new_forecasts) > 0) {
+  hefs_daily_new <- new_forecasts %>%
+    mutate(
+      forecast_date = as.Date(date_time),
+      lead_days     = as.integer(forecast_date - init_date)
+    ) %>%
+    filter(lead_days >= 1, lead_days <= 10) %>%  # keep up to 10-day lead
+    group_by(init_date, forecast_date, lead_days, ensemble_member) %>%
+    summarise(
+      mean_q_cfs = mean(value * 35.3147, na.rm = TRUE),  # convert CMS → CFS
+      .groups = "drop"
+    )
+
+  # Merge with existing archive
+  hefs_daily <- bind_rows(existing, hefs_daily_new) %>%
+    arrange(init_date, forecast_date, ensemble_member)
+} else {
+  hefs_daily <- existing
+}
+
+cat("Total HEFS archive rows (daily, all ensemble members):",
+    nrow(hefs_daily), "\n")
+cat("Date range (init_date):",
+    as.character(range(hefs_daily$init_date)), "\n")
+cat("Lead days covered:", paste(sort(unique(hefs_daily$lead_days)), collapse = ", "), "\n")
+cat("Ensemble members:", length(unique(hefs_daily$ensemble_member)), "\n")
+```
+
+---
+
+# Summarise Ensemble
+
+Compute ensemble mean and quantiles (p10, p50, p90) per init_date × lead_days.
+These are the primary features used in `07_forecast_data_prep.Rmd`.
+
+```{r ensemble-summary}
+hefs_summary <- hefs_daily %>%
+  group_by(init_date, forecast_date, lead_days) %>%
+  summarise(
+    hefs_mean_cfs = mean(mean_q_cfs, na.rm = TRUE),
+    hefs_p10_cfs  = quantile(mean_q_cfs, 0.10, na.rm = TRUE),
+    hefs_p50_cfs  = quantile(mean_q_cfs, 0.50, na.rm = TRUE),
+    hefs_p90_cfs  = quantile(mean_q_cfs, 0.90, na.rm = TRUE),
+    hefs_spread   = hefs_p90_cfs - hefs_p10_cfs,
+    n_members     = n_distinct(ensemble_member),
+    .groups = "drop"
+  )
+
+cat("HEFS summary rows:", nrow(hefs_summary), "\n")
+```
+
+---
+
+# Quick Sanity Plot
+
+```{r hefs-plot, fig.dim = c(12, 4)}
+# Compare HEFS ensemble mean to observed flow for a recent period
+obs_flow <- cdssr::get_sw_ts(
+  abbrev     = "CLAFTCCO",
+  start_date = as.character(HEFS_START_DATE),
+  end_date   = as.character(HEFS_END_DATE),
+  timescale  = "day"
+) %>%
+  mutate(date = as.Date(datetime)) %>%
+  select(date, observed_cfs = value)
+
+hefs_summary %>%
+  filter(lead_days == 1) %>%
+  left_join(obs_flow, by = c("forecast_date" = "date")) %>%
+  pivot_longer(cols = c(hefs_mean_cfs, observed_cfs),
+               names_to = "series", values_to = "cfs") %>%
+  ggplot(aes(x = forecast_date, y = cfs, color = series)) +
+  geom_line(linewidth = 0.5, alpha = 0.8) +
+  scale_color_manual(values = c(hefs_mean_cfs = "steelblue",
+                                observed_cfs  = "black")) +
+  scale_y_log10() +
+  theme_bw() +
+  labs(title = "HEFS 1-day-ahead ensemble mean vs. observed Canyon Mouth flow",
+       x = NULL, y = "Discharge (CFS, log scale)", color = NULL)
+```
+
+---
+
+# Save
+
+```{r save}
+write_parquet(hefs_daily,
+              here("data/derived/models/turbidity_forecast/hefs_forecasts_raw.parquet"))
+write_parquet(hefs_summary,
+              here("data/derived/models/turbidity_forecast/hefs_forecasts_summary.parquet"))
+
+cat("Saved raw ensemble:", here("data/derived/models/turbidity_forecast/hefs_forecasts_raw.parquet"), "\n")
+cat("Saved summary:", here("data/derived/models/turbidity_forecast/hefs_forecasts_summary.parquet"), "\n")
+```

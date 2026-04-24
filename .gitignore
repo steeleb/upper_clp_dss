@@ -5,6 +5,9 @@
 .Ruserdata
 **.Renviron
 
+# Claude artifacts
+.claude
+
 # ignore data, creds, docs, env folders in the project root
 data
 creds
